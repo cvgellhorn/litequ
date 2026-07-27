@@ -1,0 +1,49 @@
+{
+  "name": "litequ",
+  "version": "1.0.0",
+  "description": "A simple same-thread queuing system for Node.js using SQLite with retry mechanism and exponential backoff",
+  "main": "src/index.js",
+  "type": "module",
+  "files": [
+    "src/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest --no-watch",
+    "lint": "eslint src/ tests/",
+    "example": "node examples/basic-usage.js"
+  },
+  "keywords": [
+    "queue",
+    "sqlite",
+    "task",
+    "retry",
+    "backoff",
+    "job"
+  ],
+  "author": "Christoph von Gellhorn",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "vitest": "^3.2.4",
+    "eslint": "^9.35.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.4",
+    "prettier": "^3.6.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cvgellhorn/litequ.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cvgellhorn/litequ/issues"
+  },
+  "homepage": "https://github.com/cvgellhorn/litequ"
+}
