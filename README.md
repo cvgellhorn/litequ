@@ -1,4 +1,4 @@
-# LiteQuu
+# LiteQu
 
 A simple, persistent task queue for Node.js using SQLite as storage. Tasks are processed in the main thread with configurable concurrency, automatic retries with exponential backoff, and comprehensive event handling.
 
@@ -17,17 +17,17 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 ## Installation
 
 ```bash
-npm i @sturmfrei/litequu
+npm i litequ
 ```
 
 ## Quick Start
 
-### Multi-Job API (Recommended)
+### Multi-Job API
 
 Create named jobs for different task types with dedicated handlers:
 
 ```javascript
-import Queue from '@sturmfrei/litequu';
+import Queue from 'litequ';
 
 // Create a queue
 const queue = new Queue({
@@ -85,36 +85,6 @@ queue.on('failed', (info) => {
 });
 ```
 
-### Single-Handler API (Legacy, still supported)
-
-For simpler use cases or backward compatibility:
-
-```javascript
-import Queue from '@sturmfrei/litequu';
-
-const queue = new Queue();
-
-// Add tasks
-queue.add({
-  type: 'send_email',
-  to: 'user@example.com',
-  subject: 'Welcome!',
-});
-
-// Process tasks with a single handler
-queue.process(async (taskData) => {
-  if (taskData.type === 'send_email') {
-    await sendEmail(taskData.to, taskData.subject);
-    return `Email sent to ${taskData.to}`;
-  }
-  throw new Error(`Unknown task type: ${taskData.type}`);
-});
-
-queue.on('completed', (info) => {
-  console.log(`Task ${info.taskId} completed:`, info.result);
-});
-```
-
 ## Configuration Options
 
 ```javascript
@@ -161,40 +131,6 @@ await emailJob.process(async (taskData) => {
 
 await smsJob.process(async (taskData) => {
   // Process SMS tasks
-});
-```
-
-#### `add(taskData)` (Legacy)
-
-Add a task to the default job queue. For new projects, use `createJob()` and `job.add()` instead.
-
-```javascript
-const taskId = queue.add({
-  action: 'process_image',
-  imageUrl: 'https://example.com/image.jpg',
-  userId: 123,
-});
-```
-
-#### `process(handler)` (Legacy)
-
-Start processing tasks with auto-polling enabled using a single handler. For new projects, use `createJob()` and `job.process()` instead.
-
-```javascript
-queue.process(async (taskData) => {
-  // Your task processing logic
-  return result;
-});
-```
-
-#### `processOnce(handler)` (Legacy)
-
-Process available tasks once without auto-polling.
-
-```javascript
-await queue.processOnce(async (taskData) => {
-  // Process single batch of tasks
-  return result;
 });
 ```
 
@@ -400,7 +336,7 @@ With jitter enabled (default), actual delays will vary by ±50% to prevent thund
 ### Multi-Service Background Jobs
 
 ```javascript
-import Queue from '@sturmfrei/litequu';
+import Queue from 'litequ';
 
 const queue = new Queue({
   dbPath: './jobs.db',
@@ -462,13 +398,15 @@ const queue = new Queue({
   pollingInterval: 2000, // Check every 2 seconds
 });
 
-// Start processing (runs continuously)
-queue.process(async (task) => {
+const workJob = queue.createJob('work');
+
+// Registering the job handler starts continuous processing
+await workJob.process(async (task) => {
   return await handleTask(task);
 });
 
 // Tasks will be processed automatically as they're added
-queue.add({ work: 'to_do' });
+workJob.add({ work: 'to_do' });
 ```
 
 ### Error Handling and Retries
@@ -478,23 +416,30 @@ const queue = new Queue({
   maxRetries: 3,
   baseRetryDelay: 1000,
 });
+const unreliableJob = queue.createJob('unreliable');
 
 queue.on('retried', (info) => {
-  console.log(`Retry ${info.retryCount} for task ${info.taskId}`);
+  console.log(
+    `[${info.jobName}] Retry ${info.retryCount} for task ${info.taskId}`
+  );
 });
 
 queue.on('failed', (info) => {
-  console.log(`Task ${info.taskId} gave up after ${info.retryCount} attempts`);
+  console.log(
+    `[${info.jobName}] Task ${info.taskId} gave up after ${info.retryCount} attempts`
+  );
   // Handle permanent failures (e.g., dead letter queue, alerting)
 });
 
-queue.process(async (task) => {
+await unreliableJob.process(async (task) => {
   // This might fail and trigger retries
   if (Math.random() < 0.5) {
     throw new Error('Simulated failure');
   }
   return 'success';
 });
+
+unreliableJob.add({ work: 'to_do' });
 ```
 
 ## Best Practices
@@ -504,15 +449,18 @@ queue.process(async (task) => {
 Since tasks run in the main thread, avoid CPU-intensive operations:
 
 ```javascript
+const emailJob = queue.createJob('email');
+
 // ✅ Good - I/O bound tasks
-queue.process(async (task) => {
+await emailJob.process(async (task) => {
   await sendEmail(task.email);
   await uploadFile(task.filePath);
   await callWebhook(task.url);
 });
 
 // ❌ Avoid - CPU intensive tasks
-queue.process(async (task) => {
+const reportJob = queue.createJob('report');
+await reportJob.process(async (task) => {
   // This will block the event loop
   return heavyComputation(task.data);
 });
@@ -521,7 +469,9 @@ queue.process(async (task) => {
 ### 2. Handle Errors Gracefully
 
 ```javascript
-queue.process(async (task) => {
+const importJob = queue.createJob('import');
+
+await importJob.process(async (task) => {
   try {
     return await processTask(task);
   } catch (error) {
@@ -544,20 +494,6 @@ const uploadJob = queue.createJob('file-upload');
 await emailJob.process(async (task) => sendEmail(task));
 await webhookJob.process(async (task) => callWebhook(task));
 await uploadJob.process(async (task) => uploadFile(task));
-
-// ❌ Avoid - single handler with switches (though still supported)
-queue.process(async (task) => {
-  switch (task.type) {
-    case 'email':
-      return await sendEmail(task);
-    case 'webhook':
-      return await callWebhook(task);
-    case 'file_upload':
-      return await uploadFile(task);
-    default:
-      throw new Error(`Unknown task type: ${task.type}`);
-  }
-});
 ```
 
 ### 4. Monitor Queue Health
