@@ -141,7 +141,6 @@ class Queue extends EventEmitter {
     this.currentRunning = 0;
     this.isProcessing = false;
     this.jobs = new Map(); // Map of job name -> Job instance
-    this.handler = null; // Deprecated: kept for backward compatibility
     this.pollingTimer = null; // used as a one-shot wake-up timer
     this._tasksAddedDuringProcessing = false; // Flag to track if tasks were added while processing
   }
@@ -173,100 +172,24 @@ class Queue extends EventEmitter {
   }
 
   /**
-   * Adds a new task to the queue.
-   * @deprecated Use createJob(name).add(taskData) instead
-   * @param {*} taskData - The data for the task (will be JSON serialized)
-   * @returns {number} The ID of the newly added task
-   * @throws {Error} When task insertion fails
-   * @fires Queue#added
-   * @fires Queue#error
-   */
-  add(taskData) {
-    try {
-      // Use a default job name for backward compatibility
-      const taskId = this.db.insertTask('default', JSON.stringify(taskData));
-      this.emit('added', { taskId, taskData });
-
-      // If auto-processing is enabled and we have a handler
-      if (this.autoProcess && this.handler) {
-        if (this.isProcessing) {
-          // Mark that tasks were added during processing to trigger continuation
-          this._tasksAddedDuringProcessing = true;
-        } else {
-          // Cancel any scheduled wake since we have immediate work now
-          this.stopPolling();
-          setImmediate(() => this._processNextBatch());
-        }
-      }
-
-      return taskId;
-    } catch (error) {
-      this.emit('error', { error, operation: 'add' });
-      throw error;
-    }
-  }
-
-  /**
-   * Sets up continuous task processing with the provided handler function.
-   * Starts polling for new tasks if autoProcess is enabled.
-   * @param {Function} handler - Function to process each task, receives task data as parameter
-   * @returns {Promise<void>} Promise that resolves after initial batch processing
-   * @throws {Error} When handler is not a function
-   */
-  async process(handler) {
-    if (typeof handler !== 'function') {
-      throw new Error('Handler must be a function');
-    }
-
-    this.handler = handler;
-
-    if (this.autoProcess) {
-      this._startPolling();
-    }
-
-    return this._processNextBatch();
-  }
-
-  /**
-   * Processes a single batch of tasks without setting up continuous processing.
-   * @param {Function} handler - Function to process each task, receives task data as parameter
-   * @returns {Promise<void>} Promise that resolves after batch processing completes
-   * @throws {Error} When handler is not a function
-   */
-  async processOnce(handler) {
-    if (typeof handler !== 'function') {
-      throw new Error('Handler must be a function');
-    }
-
-    return this._processNextBatch(handler);
-  }
-
-  /**
    * Processes the next batch of available tasks.
    * @internal - This method is part of the internal API between Job and Queue
-   * @param {Function|null} [oneTimeHandler=null] - Optional one-time handler, otherwise uses instance handler
    * @returns {Promise<void>} Promise that resolves after batch processing
-   * @throws {Error} When no handler is provided
    * @fires Queue#error
    */
-  async _processNextBatch(oneTimeHandler = null) {
-    if (this.isProcessing && !oneTimeHandler) {
+  async _processNextBatch() {
+    if (this.isProcessing) {
       return; // Already processing
     }
 
-    const handlerToUse = oneTimeHandler || this.handler;
-
-    // Check if we have any jobs with handlers or a legacy handler
     const hasJobHandlers = Array.from(this.jobs.values()).some(
       (job) => job.handler
     );
-    if (!handlerToUse && !hasJobHandlers) {
-      // No handlers available, nothing to process
+    if (!hasJobHandlers) {
       return;
     }
 
     this.isProcessing = true;
-    // Reset the flag at the start of each batch
     this._tasksAddedDuringProcessing = false;
 
     try {
@@ -277,55 +200,47 @@ class Queue extends EventEmitter {
 
       const now = new Date().toISOString();
 
-      // Get job names that have handlers registered
       const jobNamesWithHandlers = Array.from(this.jobs.entries())
         .filter(([, job]) => job.handler)
         .map(([name]) => name);
 
-      // Fetch tasks for jobs with handlers, or all tasks if using legacy handler
-      const tasks = handlerToUse
-        ? this.db.getPendingTasks(availableSlots, now)
-        : this.db.getPendingTasks(availableSlots, now, jobNamesWithHandlers);
-
-      const processingPromises = tasks.map((task) =>
-        this._processTask(task, handlerToUse)
+      const tasks = this.db.getPendingTasks(
+        availableSlots,
+        now,
+        jobNamesWithHandlers
       );
+
+      const processingPromises = tasks.map((task) => this._processTask(task));
       await Promise.all(processingPromises);
 
-      // If there might be more tasks, process them
       if (
         tasks.length === availableSlots &&
         this.currentRunning < this.maxConcurrent
       ) {
-        setImmediate(() => this._processNextBatch(oneTimeHandler));
+        setImmediate(() => this._processNextBatch());
       }
     } catch (error) {
       this.emit('error', { error, operation: 'process' });
     } finally {
-      if (!oneTimeHandler) {
-        this.isProcessing = false;
+      this.isProcessing = false;
 
-        // Check if tasks were added during processing and continue immediately
-        if (this._tasksAddedDuringProcessing) {
-          this._tasksAddedDuringProcessing = false;
-          setImmediate(() => this._processNextBatch());
-        } else {
-          // No new tasks added, schedule next wake based on retry times
-          this._scheduleNextWake();
-        }
+      if (this._tasksAddedDuringProcessing) {
+        this._tasksAddedDuringProcessing = false;
+        setImmediate(() => this._processNextBatch());
+      } else {
+        this._scheduleNextWake();
       }
     }
   }
 
   /**
-   * Processes a single task with the provided handler.
+   * Processes a single task.
    * @private
    * @param {Object} task - The task object from the database
-   * @param {Function} legacyHandler - Optional legacy handler function (for backward compatibility)
    * @returns {Promise<void>} Promise that resolves after task processing
    * @fires Queue#completed
    */
-  async _processTask(task, legacyHandler = null) {
+  async _processTask(task) {
     this.currentRunning++;
 
     try {
@@ -338,34 +253,17 @@ class Queue extends EventEmitter {
         throw new Error(`Invalid task data JSON: ${parseError.message}`);
       }
 
-      // Determine which handler to use
-      let handler;
-      let job = null;
-
-      if (legacyHandler) {
-        // Use legacy handler for backward compatibility
-        handler = legacyHandler;
-      } else {
-        // Find the job for this task
-        job = this.jobs.get(task.job_name);
-        if (!job || !job.handler) {
-          throw new Error(`No handler registered for job: ${task.job_name}`);
-        }
-        handler = job.handler;
+      const job = this.jobs.get(task.job_name);
+      if (!job || !job.handler) {
+        throw new Error(`No handler registered for job: ${task.job_name}`);
       }
 
-      const result = await handler(taskData);
+      const result = await job.handler(taskData);
       this.db.updateTaskStatus(task.id, 'completed', task.retry_count, null);
 
-      // Emit through job instance if available, which will bubble up to queue
-      if (job) {
-        job._emit('completed', { taskId: task.id, result, taskData });
-      } else {
-        // Legacy: emit directly on queue
-        this.emit('completed', { taskId: task.id, result, taskData });
-      }
+      job._emit('completed', { taskId: task.id, result, taskData });
     } catch (error) {
-      await this._handleTaskFailure(task, error, legacyHandler);
+      await this._handleTaskFailure(task, error);
     } finally {
       this.currentRunning--;
     }
@@ -376,12 +274,11 @@ class Queue extends EventEmitter {
    * @private
    * @param {Object} task - The failed task object
    * @param {Error} error - The error that caused the task to fail
-   * @param {Function} legacyHandler - Optional legacy handler (for backward compatibility)
    * @returns {Promise<void>} Promise that resolves after handling the failure
    * @fires Queue#retried
    * @fires Queue#failed
    */
-  async _handleTaskFailure(task, error, legacyHandler = null) {
+  async _handleTaskFailure(task, error) {
     const retryCount = task.retry_count + 1;
     const job = this.jobs.get(task.job_name);
 
@@ -412,15 +309,12 @@ class Queue extends EventEmitter {
         error: error.message,
       };
 
-      // Emit through job instance if available, which will bubble up to queue
-      if (job && !legacyHandler) {
+      if (job) {
         job._emit('retried', eventData);
       } else {
-        // Legacy: emit directly on queue
-        this.emit('retried', eventData);
+        this.emit('retried', { ...eventData, jobName: task.job_name });
       }
 
-      // Ensure a wake-up is scheduled for future processing
       this._scheduleNextWake();
     } else {
       this.db.updateTaskStatus(task.id, 'failed', retryCount, null);
@@ -440,31 +334,12 @@ class Queue extends EventEmitter {
         retryCount,
       };
 
-      // Emit through job instance if available, which will bubble up to queue
-      if (job && !legacyHandler) {
+      if (job) {
         job._emit('failed', eventData);
       } else {
-        // Legacy: emit directly on queue
-        this.emit('failed', eventData);
+        this.emit('failed', { ...eventData, jobName: task.job_name });
       }
     }
-  }
-
-  /**
-   * Starts polling for new tasks at regular intervals.
-   * @private
-   * @returns {void}
-   */
-  _startPolling() {
-    // Start by scheduling an immediate wake to process any ready tasks now
-    const hasAnyHandler =
-      this.handler || Array.from(this.jobs.values()).some((job) => job.handler);
-    if (!this.isProcessing && hasAnyHandler) {
-      setImmediate(() => this._processNextBatch());
-    }
-
-    // After that, rely on one-shot wake scheduling instead of a persistent interval
-    this._scheduleNextWake();
   }
 
   /**
@@ -489,8 +364,9 @@ class Queue extends EventEmitter {
     this.stopPolling();
 
     // Nothing to schedule if we are not auto-processing or have no handlers
-    const hasAnyHandler =
-      this.handler || Array.from(this.jobs.values()).some((job) => job.handler);
+    const hasAnyHandler = Array.from(this.jobs.values()).some(
+      (job) => job.handler
+    );
     if (!this.autoProcess || !hasAnyHandler) {
       return;
     }
@@ -510,9 +386,9 @@ class Queue extends EventEmitter {
     const delay = Math.max(0, new Date(earliest).getTime() - Date.now());
     const timer = setTimeout(() => {
       // Guard: handler might have been removed/stopped
-      const hasHandler =
-        this.handler ||
-        Array.from(this.jobs.values()).some((job) => job.handler);
+      const hasHandler = Array.from(this.jobs.values()).some(
+        (job) => job.handler
+      );
       if (!this.isProcessing && hasHandler) {
         this._processNextBatch();
       }
@@ -569,7 +445,7 @@ class Queue extends EventEmitter {
 
   /**
    * Gets the current status of the queue.
-   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, hasHandler, and jobs properties
+   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, and jobs properties
    */
   get status() {
     const jobsStatus = {};
@@ -584,7 +460,6 @@ class Queue extends EventEmitter {
       maxConcurrent: this.maxConcurrent,
       isProcessing: this.isProcessing,
       autoProcess: this.autoProcess,
-      hasHandler: !!this.handler,
       jobs: jobsStatus,
     };
   }

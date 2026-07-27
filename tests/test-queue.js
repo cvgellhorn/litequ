@@ -183,4 +183,19 @@ describe('Queue', () => {
       expect(result).toBeTruthy();
     });
   });
+
+  describe('legacy API removed', () => {
+    it('should not expose queue.add, queue.process, or queue.processOnce', () => {
+      expect(queue.add).toBeUndefined();
+      expect(queue.process).toBeUndefined();
+      expect(queue.processOnce).toBeUndefined();
+    });
+
+    it('should not expose queue-level handler state', () => {
+      expect(queue.handler).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(queue.status, 'hasHandler')).toBe(
+        false
+      );
+    });
+  });
 });
