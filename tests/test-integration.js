@@ -174,11 +174,12 @@ describe('Integration Tests', () => {
       });
 
       // Add many tasks
+      const job = highConcurrencyQueue.createJob('concurrent');
       const taskCount = 10; // Reduced for more reliable testing
       const taskIds = [];
 
       for (let i = 0; i < taskCount; i++) {
-        const taskId = await highConcurrencyQueue.add({
+        const taskId = job.add({
           id: i,
           delay: 30, // Fixed delay for predictability
         });
@@ -206,14 +207,15 @@ describe('Integration Tests', () => {
       };
 
       // Process all tasks in one go
-      await highConcurrencyQueue.processOnce(handler);
+      await job.process(handler);
+      await highConcurrencyQueue._processNextBatch();
 
       // Wait for all async operations to complete - longer timeout for slow systems
       await new Promise((resolve) => setTimeout(resolve, 200));
 
       // If we still don't have all tasks completed, try processing again
       if (completedTasks.length < taskCount) {
-        await highConcurrencyQueue.processOnce(handler);
+        await highConcurrencyQueue._processNextBatch();
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
 
@@ -226,8 +228,9 @@ describe('Integration Tests', () => {
 
     it('should persist tasks across queue restarts', async () => {
       // Add tasks to first queue instance
-      queue.add({ persistent: true, data: 'test1' });
-      queue.add({ persistent: true, data: 'test2' });
+      const job = queue.createJob('persist');
+      job.add({ persistent: true, data: 'test1' });
+      job.add({ persistent: true, data: 'test2' });
 
       // Close the queue
       await queue.close();
@@ -241,16 +244,18 @@ describe('Integration Tests', () => {
       });
 
       // Add test tasks directly to new queue since in-memory DBs don't persist
-      await newQueue.add({ persistent: true, data: 'test1' });
-      await newQueue.add({ persistent: true, data: 'test2' });
+      const newJob = newQueue.createJob('persist');
+      newJob.add({ persistent: true, data: 'test1' });
+      newJob.add({ persistent: true, data: 'test2' });
 
       const completedTasks = [];
       newQueue.on('completed', (info) => completedTasks.push(info));
 
       // Process tasks with new instance
-      await newQueue.processOnce(async (taskData) => {
+      await newJob.process(async (taskData) => {
         return `Processed: ${taskData.data}`;
       });
+      await newQueue._processNextBatch();
 
       expect(completedTasks).toHaveLength(2);
       expect(completedTasks[0].taskData.persistent).toBe(true);

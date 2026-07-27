@@ -236,48 +236,4 @@ describe('Auto-Continue Processing', () => {
     expect(ids).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 
-  it('should work with legacy queue.add() and queue.process() methods', async () => {
-    const legacyQueue = new Queue({
-      dbPath: ':memory:',
-      autoProcess: true,
-      maxConcurrent: 2,
-    });
-
-    const processedTasks = [];
-
-    const completedPromise = new Promise((resolve) => {
-      let completedCount = 0;
-      legacyQueue.on('completed', ({ taskData }) => {
-        processedTasks.push(taskData);
-        completedCount++;
-        if (completedCount === 3) {
-          resolve();
-        }
-      });
-    });
-
-    // Legacy handler that adds tasks during processing
-    await legacyQueue.process(async (taskData) => {
-      if (taskData.id === 1) {
-        legacyQueue.add({ id: 2 });
-        legacyQueue.add({ id: 3 });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      return `Processed ${taskData.id}`;
-    });
-
-    // Add initial task
-    legacyQueue.add({ id: 1 });
-
-    // Wait for all tasks to complete
-    await Promise.race([
-      completedPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Test timeout')), 5000)
-      ),
-    ]);
-
-    expect(processedTasks).toHaveLength(3);
-    await legacyQueue.close();
-  });
 });
