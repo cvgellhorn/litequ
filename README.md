@@ -11,7 +11,7 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 - 🚦 **Concurrency Control**: Configurable maximum concurrent task processing
 - 📊 **Event-Driven**: Comprehensive event system with job-level and queue-level events
 - 🔍 **Task Management**: Query task status, statistics, and cleanup utilities
-- 🕐 **Auto-Processing**: Optional automatic task processing with polling
+- 🕐 **Auto-Processing**: Wakes when tasks are added and schedules retries when due
 - 📦 **Zero Config**: Works out of the box with sensible defaults
 
 ## Installation
@@ -100,9 +100,6 @@ const queue = new Queue({
 
   // Base retry delay in milliseconds (default: 15_000ms)
   baseRetryDelay: 2000,
-
-  // Polling interval for auto-processing (default: 5000ms)
-  pollingInterval: 1000,
 
   // Enable automatic processing (default: true)
   autoProcess: true,
@@ -390,22 +387,22 @@ imageJob.on('failed', (info) => {
 });
 ```
 
-### Auto-Processing with Polling
+### Event-Driven Auto-Processing
 
 ```javascript
 const queue = new Queue({
   autoProcess: true,
-  pollingInterval: 2000, // Check every 2 seconds
 });
 
 const workJob = queue.createJob('work');
 
-// Registering the job handler starts continuous processing
+// Registering the job handler enables automatic processing
 await workJob.process(async (task) => {
   return await handleTask(task);
 });
 
-// Tasks will be processed automatically as they're added
+// Adding a task wakes the queue immediately. Failed tasks schedule a
+// one-shot wake-up for their next retry rather than using interval polling.
 workJob.add({ work: 'to_do' });
 ```
 

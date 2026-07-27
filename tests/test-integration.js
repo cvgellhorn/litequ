@@ -265,12 +265,11 @@ describe('Integration Tests', () => {
     });
   });
 
-  describe('Auto-processing with polling', () => {
+  describe('Event-driven auto-processing', () => {
     it('should automatically process tasks when autoProcess is enabled', async () => {
       const autoQueue = new Queue({
         dbPath: ':memory:',
         autoProcess: true,
-        pollingInterval: 50,
         maxRetries: 1,
       });
 
@@ -308,7 +307,6 @@ describe('Integration Tests', () => {
       const autoQueue = new Queue({
         dbPath: ':memory:',
         autoProcess: true,
-        pollingInterval: 50,
         maxRetries: 1,
       });
 

@@ -10,7 +10,6 @@ async function autoProcessingExample() {
     maxConcurrent: 3,
     maxRetries: 2,
     baseRetryDelay: 2000, // 2 seconds
-    pollingInterval: 1000, // Check for new tasks every second
     autoProcess: true, // Enable automatic processing
   });
 
@@ -171,7 +170,7 @@ async function autoProcessingExample() {
       subject: 'Weekly Updates',
     });
 
-    // Add more tasks periodically to demonstrate continuous processing
+    // Add more tasks periodically to demonstrate wake-on-add processing
     let taskCounter = 5;
     const addTasksInterval = setInterval(async () => {
       const randomService = Math.random();
