@@ -235,5 +235,4 @@ describe('Auto-Continue Processing', () => {
     const ids = processedTasks.map((t) => t.id);
     expect(ids).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
-
 });

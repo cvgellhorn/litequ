@@ -211,7 +211,7 @@ describe('Event Bubbling - Job to Queue', () => {
       });
 
       let attempts = 0;
-      await job.process(async (data) => {
+      await job.process(async () => {
         attempts++;
         if (attempts === 1) {
           throw new Error('First attempt fails');

@@ -193,9 +193,9 @@ describe('Queue', () => {
 
     it('should not expose queue-level handler state', () => {
       expect(queue.handler).toBeUndefined();
-      expect(Object.prototype.hasOwnProperty.call(queue.status, 'hasHandler')).toBe(
-        false
-      );
+      expect(
+        Object.prototype.hasOwnProperty.call(queue.status, 'hasHandler')
+      ).toBe(false);
     });
   });
 });
