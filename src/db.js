@@ -114,6 +114,11 @@ class Database {
     this.dbPath = dbPath;
     this.busyTimeout = options.busyTimeout ?? 5000;
     this.logger = createLogger(options.logger);
+    /**
+     * The better-sqlite3 connection, or null before it's opened. Typed as
+     * `any` so consumers don't need better-sqlite3's type definitions.
+     * @type {any}
+     */
     this.db = null;
     this.initialized = false;
     this.closed = false;
@@ -128,7 +133,7 @@ class Database {
    * Implements lazy connection initialization, applies the busy timeout and,
    * for files, sets WAL mode for better concurrency.
    * @private
-   * @returns {BetterSqlite3.Database} The database connection instance
+   * @returns {any} The better-sqlite3 connection
    * @throws {Error} When database connection fails
    */
   _createConnection() {

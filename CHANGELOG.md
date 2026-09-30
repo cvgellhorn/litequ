@@ -48,3 +48,4 @@ This release changes some defaults. Read the breaking changes before upgrading f
 - `job.add(data, { dedupeKey, throttleMs })` throttles in the database and returns `null` for a dropped task. It uses schema version 3, which adds the `dedupe_key` column and an index on `(job_name, dedupe_key, created_at)`.
 - `queue.defineJob(name, { handler, onCompleted, onFailed, onRetried })`, which replaces its earlier handler and callbacks instead of adding duplicates.
 - `Database.claimTasks()`, `Database.extendLease()` and `Database.getNextWakeTime()`.
+- TypeScript declarations (`types/`), generated from JSDoc at pack time, plus a `typecheck` script.

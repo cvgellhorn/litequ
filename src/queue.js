@@ -98,7 +98,7 @@ class Job extends EventEmitter {
 
     // If autoProcess is enabled, trigger processing
     if (this.queue.autoProcess) {
-      return this.queue._processNextBatch();
+      await this.queue._processNextBatch();
     }
   }
 
@@ -215,6 +215,25 @@ class Job extends EventEmitter {
 }
 
 /**
+ * Options for `new Queue()` and `Queue.shared()`.
+ * @typedef {Object} QueueOptions
+ * @property {string} [dbPath=':memory:'] - Path to the SQLite database file. Use a file path for persistence.
+ * @property {number} [maxConcurrent=5] - Maximum number of tasks to process concurrently
+ * @property {number} [maxRetries=15] - Maximum number of retry attempts for failed tasks
+ * @property {number} [baseRetryDelay=15_000] - Base delay in milliseconds between retries (exponential backoff)
+ * @property {boolean} [autoProcess=true] - Whether to automatically process tasks when added
+ * @property {boolean} [jitter=true] - Whether to add randomness to retry delays
+ * @property {number} [busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
+ * @property {Partial<import('./logger.js').Logger>} [logger=console] - Logger with error, warn and info methods
+ * @property {boolean} [recoverInterrupted=true] - Restart tasks a stopped process left in `processing` when a file database is opened
+ * @property {import('./roles.js').WritableCheck} [writable] - Returns whether this process may write to `dbPath`; when omitted the queue is always writable
+ * @property {string} [readOnlyDbPath=':memory:'] - Database used while `writable()` returns false
+ * @property {'memory' | 'throw'} [whenReadOnly='memory'] - While read-only, store new tasks in `readOnlyDbPath` (`'memory'`) or make `add()` throw `QueueReadOnlyError` (`'throw'`)
+ * @property {number} [roleCheckInterval=10_000] - Milliseconds between `writable()` checks
+ * @property {number} [leaseMs=60_000] - How long a claimed task stays reserved for this queue; renewed every `leaseMs / 3` while the task runs
+ */
+
+/**
  * Queue class for managing and processing background tasks.
  * Extends EventEmitter to provide event-based notifications for task lifecycle events.
  *
@@ -231,21 +250,7 @@ class Job extends EventEmitter {
 class Queue extends EventEmitter {
   /**
    * Creates a new Queue instance.
-   * @param {Object} [options={}] - Configuration options for the queue
-   * @param {string} [options.dbPath=':memory:'] - Path to the SQLite database file. Use a file path for persistence.
-   * @param {number} [options.maxConcurrent=5] - Maximum number of tasks to process concurrently
-   * @param {number} [options.maxRetries=15] - Maximum number of retry attempts for failed tasks
-   * @param {number} [options.baseRetryDelay=15_000] - Base delay in milliseconds between retries (exponential backoff)
-   * @param {boolean} [options.autoProcess=true] - Whether to automatically process tasks when added
-   * @param {boolean} [options.jitter=true] - Whether to add randomness to retry delays
-   * @param {number} [options.busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
-   * @param {Partial<import('./logger.js').Logger>} [options.logger=console] - Logger with error, warn and info methods
-   * @param {boolean} [options.recoverInterrupted=true] - Restart tasks a stopped process left in `processing` when a file database is opened
-   * @param {import('./roles.js').WritableCheck} [options.writable] - Returns whether this process may write to `dbPath`; when omitted the queue is always writable
-   * @param {string} [options.readOnlyDbPath=':memory:'] - Database used while `writable()` returns false
-   * @param {'memory' | 'throw'} [options.whenReadOnly='memory'] - While read-only, store new tasks in `readOnlyDbPath` (`'memory'`) or make `add()` throw `QueueReadOnlyError` (`'throw'`)
-   * @param {number} [options.roleCheckInterval=10_000] - Milliseconds between `writable()` checks
-   * @param {number} [options.leaseMs=60_000] - How long a claimed task stays reserved for this queue; renewed every `leaseMs / 3` while the task runs
+   * @param {QueueOptions} [options={}] - Configuration options for the queue
    */
   constructor(options = {}) {
     super();
@@ -317,8 +322,7 @@ class Queue extends EventEmitter {
    * If a later call passes different options for the same key, a warning is
    * logged and the existing instance is returned unchanged. Only primitive
    * option values are compared.
-   * @param {Object} [options={}] - Queue options, plus `key`
-   * @param {string} [options.key] - Registry key; defaults to the resolved `dbPath`, and is required for an in-memory database
+   * @param {QueueOptions & { key?: string }} [options={}] - Queue options, plus `key`: the registry key, which defaults to the resolved `dbPath` and is required for an in-memory database
    * @returns {Queue} The shared queue
    * @throws {TypeError} When an in-memory database has no `key`
    */
@@ -755,7 +759,7 @@ class Queue extends EventEmitter {
   /**
    * Starts a batch on the next turn of the event loop. While it's pending the
    * queue doesn't count as idle.
-   * @private
+   * @internal - This method is part of the internal API between Job and Queue
    * @returns {void}
    */
   _scheduleBatch() {

@@ -12,6 +12,11 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 - 📊 **Event-Driven**: Comprehensive event system with job-level and queue-level events
 - 🔍 **Task Management**: Query task status, statistics, and cleanup utilities
 - 🕐 **Auto-Processing**: Wakes when tasks are added and schedules retries when due
+- 🔒 **Leases**: Several processes can share one file without running a task twice at the same time, and tasks from crashed workers are picked up again
+- 🪞 **Read-Only Replicas**: Follows a writable role, for example the LiteFS primary, and switches databases when it changes
+- ⏱️ **Throttling**: Drop duplicate tasks per key within a time window, stored in the database
+- ⏸️ **Lifecycle Control**: `pause()`, `resume()`, `whenIdle()` and `close({ timeout })`
+- 🧩 **Typed**: Ships TypeScript declarations generated from JSDoc
 - 📦 **Zero Config**: Works out of the box with sensible defaults
 
 ## Installation
@@ -19,6 +24,8 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 ```bash
 npm i litequ
 ```
+
+Upgrading from `litequ` 1.x or `@sturmfrei/litequu` 2.x? Some defaults changed in 3.0.0, see the [changelog](CHANGELOG.md).
 
 ## Quick Start
 
@@ -796,6 +803,10 @@ process.on('SIGTERM', async () => {
 - **Main Thread**: Not suitable for CPU-intensive tasks
 - **SQLite Concurrency**: Write operations are serialized by SQLite
 - **Memory Usage**: Large task payloads are stored in the database
+
+## TypeScript
+
+The package ships declaration files (`types/`), generated from the JSDoc in `src/` when the package is packed. They work in TypeScript projects and in JavaScript projects with `checkJs`. `Queue`, `Job`, `Database`, `QueueReadOnlyError`, `litefsWritable`, `sqliteWritable` and the `QueueOptions` type are exported. The declarations need `@types/node`, but not better-sqlite3's types.
 
 ## Contributing
 
