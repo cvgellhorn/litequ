@@ -13,7 +13,7 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 - 🔍 **Task Management**: Query task status, statistics, and cleanup utilities
 - 🕐 **Auto-Processing**: Wakes when tasks are added and schedules retries when due
 - 🔒 **Leases**: Several processes can share one file without running a task twice at the same time, and tasks from crashed workers are picked up again
-- 🪞 **Read-Only Replicas**: Follows a writable role that your own callback reports, and switches databases when it changes
+- 🪞 **Read-Only Replicas**: Follows a writable role, for example the LiteFS primary, and switches databases when it changes
 - ⏱️ **Throttling**: Drop duplicate tasks per key within a time window, stored in the database
 - ⏸️ **Lifecycle Control**: `pause()`, `resume()`, `whenIdle()` and `close({ timeout })`
 - 🧩 **Typed**: Ships TypeScript declarations generated from JSDoc
@@ -165,7 +165,7 @@ Handlers should be safe to repeat. Choose a `leaseMs` well above your longest ev
 
 ### Read-only replicas
 
-Some deployments have one writable primary and read-only replicas sharing a replicated database file. How a node knows its role depends on the platform, so litequ doesn't guess. You pass a `writable` callback that returns `true` when this process may write to `dbPath` and `false` when it's read-only, and the queue follows it:
+Some deployments have one writable primary and read-only replicas sharing a replicated database file, for example LiteFS on Fly.io. Pass a `writable` function and the queue follows the node's role:
 
 - At construction the queue opens `dbPath` if `writable()` returns true, and `readOnlyDbPath` (default `':memory:'`) otherwise. If `writable()` throws at construction, the queue starts read-only and logs the error.
 - Every `roleCheckInterval` ms (default 10 s) it calls `writable()` again. The timer doesn't keep the process alive and stops on `close()`.
@@ -181,29 +181,17 @@ Some deployments have one writable primary and read-only replicas sharing a repl
 
 `queue.writable` and `status.writable` report the current role, and `status.dbPath` the database in use.
 
-#### Writing a `writable` callback
+#### Built-in `writable` checks
 
-The callback is called at construction and then every `roleCheckInterval` ms. It must return a boolean synchronously, and it should be cheap. Base it on whatever your platform uses to mark the primary:
+**`litefsWritable(dir = process.env.LITEFS_DIR)`** reads LiteFS's `.primary` file. LiteFS writes `<dir>/.primary` only on replicas, containing the primary's hostname. The check returns true when the file can't be read (this node is the primary) or when its trimmed contents equal `os.hostname()`. This is the same rule `litefs-js` uses. When `dir` is unset, the check always returns true, so local development and tests work unchanged.
 
-```javascript
-// An environment variable set by your deployment
-const queue = new Queue({
-  dbPath: '/data/queue.db',
-  writable: () => process.env.NODE_ROLE === 'primary',
-});
-```
-
-Without a `writable` callback, the queue is always writable. See [Example: LiteFS](#example-litefs) for a callback based on a file the platform writes.
-
-#### `sqliteWritable(dbPath)`
-
-If your platform gives you no role signal, `sqliteWritable(dbPath)` returns a generic callback that probes the file itself. On every call it opens a short-lived connection and creates and drops a scratch table inside a savepoint that is rolled back. It returns false when SQLite answers `SQLITE_READONLY` or `SQLITE_CANTOPEN`. Things to know:
+**`sqliteWritable(dbPath)`** probes the file itself. On every call it opens a short-lived connection and creates and drops a scratch table inside a savepoint that is rolled back. It returns false when SQLite answers `SQLITE_READONLY` or `SQLITE_CANTOPEN`. Things to know:
 
 - It takes the write lock briefly on every check. With another writer active it waits up to its own `busyTimeout` (default 1000 ms, `sqliteWritable(dbPath, { busyTimeout })`) and throws on `SQLITE_BUSY`, which keeps the current role.
 - A missing file is created if its directory is writable.
 - It does a real write because `BEGIN IMMEDIATE` alone succeeds on read-only files.
-- It has **not** been verified against replicated filesystems. If your platform tells you which node is the primary, a callback based on that is more reliable.
-- It doesn't use file permission bits, which FUSE-based filesystems may not report reliably.
+- It has **not** been verified against a LiteFS replica. LiteFS users should use `litefsWritable`.
+- Neither check uses file permission bits. On FUSE mounts such as LiteFS, they don't reflect whether writes are refused.
 
 #### `switchDatabase(dbPath, { moveOpenTasks, recoverInterrupted })`
 
@@ -224,32 +212,16 @@ await queue.switchDatabase('/data/queue.db', {
 
 Concurrent calls run one after another. Calling it after `close()` rejects.
 
-### Example: LiteFS
+### LiteFS
 
-litequ knows nothing about LiteFS; this example shows how an app on Fly.io with LiteFS wires it up. There is one writable primary and several read-only replicas, and the queue file sits on the replicated mount. LiteFS writes `<LITEFS_DIR>/.primary` only on replicas, containing the primary's hostname, so the app's callback checks that file:
+This setup runs litequ on Fly.io with LiteFS. There is one writable primary and several read-only replicas, and the queue file sits on the replicated mount:
 
 ```js
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import Queue from 'litequ';
-
-// True on the LiteFS primary. Same rule as litefs-js's getInstanceInfoSync:
-// no readable .primary file means this node is the primary.
-function isLiteFsPrimary() {
-  const dir = process.env.LITEFS_DIR;
-  if (!dir) return true; // local development and tests
-  try {
-    const primary = fs.readFileSync(path.join(dir, '.primary'), 'utf8');
-    return primary.trim() === os.hostname();
-  } catch {
-    return true;
-  }
-}
+import Queue, { litefsWritable } from 'litequ';
 
 const queue = Queue.shared({
   dbPath: process.env.QUEUE_DATABASE_PATH,
-  writable: isLiteFsPrimary,
+  writable: litefsWritable(process.env.LITEFS_DIR),
   whenReadOnly: 'memory',
   busyTimeout: 5000,
   logger,
@@ -266,12 +238,12 @@ process.once('SIGINT', () => queue.close({ timeout: 4000 }));
 What each piece does:
 
 - **`Queue.shared`** gives every bundle in the server build the same queue, so the file has one connection and one worker loop per process.
-- **`isLiteFsPrimary`** runs every `roleCheckInterval` (10 s).
+- **`litefsWritable`** checks LiteFS's `.primary` file every `roleCheckInterval` (10 s).
   - The primary works on the file.
   - A replica keeps new tasks in memory and processes them there.
   - When a replica is promoted, its open tasks move into the file.
   - When the primary is demoted, its file tasks stay for the new primary.
-  - Without `LITEFS_DIR` (local development, tests), it returns true, so the queue is always writable.
+  - Without `LITEFS_DIR` (local development, tests), the queue is always writable.
 - **`defineJob`** can run once per bundle without stacking duplicate `onFailed` listeners.
 - **`close({ timeout })`** lets running tasks finish before the machine stops. A task that is still running when the timeout hits keeps its lease. It's picked up again after the lease expires or when the next process opens the file.
 
@@ -834,7 +806,7 @@ process.on('SIGTERM', async () => {
 
 ## TypeScript
 
-The package ships declaration files (`types/`), generated from the JSDoc in `src/` when the package is packed. They work in TypeScript projects and in JavaScript projects with `checkJs`. `Queue`, `Job`, `Database`, `QueueReadOnlyError`, `sqliteWritable` and the `QueueOptions` type are exported. The declarations need `@types/node`, but not better-sqlite3's types.
+The package ships declaration files (`types/`), generated from the JSDoc in `src/` when the package is packed. They work in TypeScript projects and in JavaScript projects with `checkJs`. `Queue`, `Job`, `Database`, `QueueReadOnlyError`, `litefsWritable`, `sqliteWritable` and the `QueueOptions` type are exported. The declarations need `@types/node`, but not better-sqlite3's types.
 
 ## Contributing
 

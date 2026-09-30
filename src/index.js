@@ -8,7 +8,7 @@
 import Queue, { Job } from './queue.js';
 import Database from './db.js';
 import { QueueReadOnlyError } from './errors.js';
-import { sqliteWritable } from './roles.js';
+import { litefsWritable, sqliteWritable } from './roles.js';
 
 /**
  * Default export - The main Queue class for task queue management.
@@ -22,6 +22,13 @@ export default Queue;
  * - `Job`: the job class for named worker types
  * - `Database`: the database class for direct database operations
  * - `QueueReadOnlyError`: thrown by `add()` on a read-only queue with `whenReadOnly: 'throw'`
- * - `sqliteWritable`: a generic `writable` check that probes the database file
+ * - `litefsWritable`, `sqliteWritable`: built-in `writable` checks
  */
-export { Queue, Job, Database, QueueReadOnlyError, sqliteWritable };
+export {
+  Queue,
+  Job,
+  Database,
+  QueueReadOnlyError,
+  litefsWritable,
+  sqliteWritable,
+};
