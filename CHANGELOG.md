@@ -26,6 +26,7 @@ This release changes some defaults. Read the breaking changes before upgrading f
 
 ### Bug fixes
 
+- `cleanup(hours)` compared SQLite `updated_at` values against an ISO cutoff. Whenever the cutoff fell on the same UTC day, for example `cleanup(1)` in the afternoon, it deleted tasks that had completed moments earlier. It now compares in SQLite's format.
 - A due retry for a job without a handler no longer makes the wake-up timer fire again and again with a 0 ms delay. Wake-ups now only consider jobs that have a handler.
 
 ### Features

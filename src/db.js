@@ -579,9 +579,11 @@ class Database {
    */
   cleanupCompletedTasks(olderThanHours = 24) {
     this.initialize();
-    const cutoffTime = new Date(
+    // updated_at is written by CURRENT_TIMESTAMP, so compare in that format;
+    // an ISO string ('T' separator) would sort after every same-day value.
+    const cutoffTime = sqliteTimestamp(
       Date.now() - olderThanHours * 60 * 60 * 1000
-    ).toISOString();
+    );
     return this.run(
       `
       DELETE FROM queue 
