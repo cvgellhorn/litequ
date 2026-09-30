@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import Database, { isMemoryPath } from './db.js';
 import { QueueReadOnlyError } from './errors.js';
@@ -148,6 +150,7 @@ class Queue extends EventEmitter {
    * @param {string} [options.readOnlyDbPath=':memory:'] - Database used while `writable()` returns false
    * @param {'memory' | 'throw'} [options.whenReadOnly='memory'] - While read-only, store new tasks in `readOnlyDbPath` (`'memory'`) or make `add()` throw `QueueReadOnlyError` (`'throw'`)
    * @param {number} [options.roleCheckInterval=10_000] - Milliseconds between `writable()` checks
+   * @param {number} [options.leaseMs=60_000] - How long a claimed task stays reserved for this queue; renewed every `leaseMs / 3` while the task runs
    */
   constructor(options = {}) {
     super();
@@ -162,6 +165,13 @@ class Queue extends EventEmitter {
     this.logger = createLogger(options.logger);
 
     this.recoverInterrupted = options.recoverInterrupted !== false;
+    this.leaseMs = options.leaseMs ?? 60_000;
+    if (!Number.isInteger(this.leaseMs) || this.leaseMs <= 0) {
+      throw new TypeError('leaseMs must be a positive integer');
+    }
+    /** Identifies this queue's leases: `${hostname}:${pid}:${random}`. */
+    this.instanceId = `${os.hostname()}:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;
+    this._heartbeats = new Set();
 
     this.writablePath = this.dbPath;
     this.readOnlyDbPath = options.readOnlyDbPath || ':memory:';
@@ -519,10 +529,11 @@ class Queue extends EventEmitter {
         .filter(([, job]) => job.handler)
         .map(([name]) => name);
 
-      const tasks = this.db.getPendingTasks(
+      const tasks = this.db.claimTasks(
         availableSlots,
         now,
-        jobNamesWithHandlers
+        jobNamesWithHandlers,
+        { lockedBy: this.instanceId, lockedUntil: this._leaseExpiry() }
       );
 
       if (tasks.length > 0) {
@@ -618,10 +629,9 @@ class Queue extends EventEmitter {
     // queue's connection changes while the handler runs.
     const db = this.db;
     this.currentRunning++;
+    const heartbeat = this._startHeartbeat(db, task);
 
     try {
-      db.updateTaskStatus(task.id, 'processing', task.retry_count, null);
-
       let taskData;
       try {
         taskData = JSON.parse(task.task_data);
@@ -635,17 +645,97 @@ class Queue extends EventEmitter {
       }
 
       const result = await job.handler(taskData);
+      this._stopHeartbeat(heartbeat);
       if (this._isResultLost(db, task)) {
         return;
       }
-      db.updateTaskStatus(task.id, 'completed', task.retry_count, null);
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'completed',
+        task.retry_count,
+        null,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
+      }
 
       job._emit('completed', { taskId: task.id, result, taskData });
     } catch (error) {
+      this._stopHeartbeat(heartbeat);
       await this._handleTaskFailure(task, error, db);
     } finally {
+      this._stopHeartbeat(heartbeat);
       this.currentRunning--;
     }
+  }
+
+  /**
+   * Returns the ISO expiry for a lease taken or renewed now.
+   * @private
+   * @returns {string} ISO timestamp `leaseMs` from now
+   */
+  _leaseExpiry() {
+    return new Date(Date.now() + this.leaseMs).toISOString();
+  }
+
+  /**
+   * Renews a running task's lease every `leaseMs / 3` so other workers don't
+   * treat it as abandoned. The timer doesn't keep the process alive.
+   * @private
+   * @param {Database} db - The database the task came from
+   * @param {Object} task - The task row
+   * @returns {ReturnType<typeof setInterval>} The heartbeat timer
+   */
+  _startHeartbeat(db, task) {
+    const timer = setInterval(
+      () => {
+        if (db.closed) {
+          this._stopHeartbeat(timer);
+          return;
+        }
+        try {
+          if (!db.extendLease(task.id, this.instanceId, this._leaseExpiry())) {
+            this._stopHeartbeat(timer);
+            this._warnLeaseLost(task);
+          }
+        } catch (error) {
+          this.logger.error(
+            `litequ: failed to renew the lease of task ${task.id}`,
+            error
+          );
+        }
+      },
+      Math.max(1, Math.floor(this.leaseMs / 3))
+    );
+    timer.unref?.();
+    this._heartbeats.add(timer);
+    return timer;
+  }
+
+  /**
+   * Stops a heartbeat timer.
+   * @private
+   * @param {ReturnType<typeof setInterval>} timer - Timer from `_startHeartbeat()`
+   * @returns {void}
+   */
+  _stopHeartbeat(timer) {
+    clearInterval(timer);
+    this._heartbeats.delete(timer);
+  }
+
+  /**
+   * Logs that another worker took over a task after its lease expired, so
+   * this worker's result is not saved.
+   * @private
+   * @param {Object} task - The task row
+   * @returns {void}
+   */
+  _warnLeaseLost(task) {
+    this.logger.warn(
+      `litequ: task ${task.id} (${task.job_name}) lost its lease to another worker; its result was not saved and it may run twice`
+    );
   }
 
   /**
@@ -693,7 +783,17 @@ class Queue extends EventEmitter {
       const delay = Math.floor(jitterDelay);
       const nextRetryAt = new Date(Date.now() + delay).toISOString();
 
-      db.updateTaskStatus(task.id, 'failed', retryCount, nextRetryAt);
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'failed',
+        retryCount,
+        nextRetryAt,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
+      }
 
       const taskData = this._parseTaskDataForEvent(task);
 
@@ -714,7 +814,17 @@ class Queue extends EventEmitter {
 
       this._scheduleNextWake();
     } else {
-      db.updateTaskStatus(task.id, 'failed', retryCount, null);
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'failed',
+        retryCount,
+        null,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
+      }
 
       const taskData = this._parseTaskDataForEvent(task);
 
@@ -802,9 +912,15 @@ class Queue extends EventEmitter {
       return;
     }
 
-    const earliest = this.db.getEarliestNextRetryTime();
+    // Wake for the next due retry, or when another worker's lease on one of
+    // our jobs expires. Jobs without a handler are ignored: they can't be
+    // claimed, and waking for them would spin.
+    const jobNames = Array.from(this.jobs.entries())
+      .filter(([, job]) => job.handler)
+      .map(([name]) => name);
+    const earliest = this.db.getNextWakeTime(jobNames);
 
-    // No scheduled retries, remain idle. New tasks will wake via add().
+    // Nothing scheduled, remain idle. New tasks will wake via add().
     if (!earliest) {
       return;
     }
@@ -967,6 +1083,12 @@ class Queue extends EventEmitter {
     }
 
     await this.db.close();
+
+    // Tasks still running after a timeout can't renew leases on a closed
+    // database; their leases expire and another worker picks them up.
+    for (const timer of this._heartbeats) {
+      this._stopHeartbeat(timer);
+    }
   }
 
   /**

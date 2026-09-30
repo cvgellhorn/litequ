@@ -124,6 +124,10 @@ const queue = new Queue({
   readOnlyDbPath: ':memory:', // database used while read-only
   whenReadOnly: 'memory', // or 'throw'
   roleCheckInterval: 10_000, // ms between writable() checks
+
+  // How long a claimed task stays reserved for this queue, renewed every
+  // leaseMs / 3 while it runs (default: 60_000)
+  leaseMs: 60_000,
 });
 ```
 
@@ -131,11 +135,26 @@ const queue = new Queue({
 
 The default database is in memory (`':memory:'`), so nothing is written to disk and tasks disappear when the process exits. Pass a file path as `dbPath` to keep tasks across restarts. File databases use WAL mode.
 
-### Interrupted tasks
+### Leases and interrupted tasks
 
-A task is marked `processing` while its handler runs. If the process dies in the middle (a crash, a deploy, a restart), the task would stay `processing` forever. With `recoverInterrupted: true` (the default), opening a file database sets those tasks back to `pending` and logs how many it restarted through `logger.info`. The tasks then run again once their job has a handler. Set `recoverInterrupted: false` to leave them alone.
+When a queue starts a task it claims it: in one atomic `UPDATE ... RETURNING` statement it marks the task `processing` and records a lease with its instance id (`queue.instanceId`, `${hostname}:${pid}:${random}`) and an expiry `leaseMs` in the future (default 60 s). While the handler runs, a heartbeat renews the lease every `leaseMs / 3`. Completing or failing the task clears the lease.
 
-This means a task that was interrupted halfway runs again from the start, so handlers should be safe to repeat.
+This is what makes it safe to run several processes, or several `Queue` instances, on one database file:
+
+- Two queues never claim the same task, because the claim is a single statement.
+- A task whose lease has expired counts as abandoned: its worker crashed, was killed, or hung without renewing. Any queue with a handler for that job claims it again, with no restart needed. The queue schedules a wake-up for the moment another worker's lease runs out.
+- If a worker finishes a task after another worker took it over, its result isn't saved. It logs a warning and emits no event for that task.
+
+With `recoverInterrupted: true` (the default), opening a file database also sets tasks left in `processing` back to `pending`, but only if their lease is missing or expired. A task with a live lease belongs to another worker that is still running it, and it's left alone. Rows from 2.x files have no lease and are restarted. The count is logged through `logger.info`. Set `recoverInterrupted: false` to skip this step. Expired tasks are still claimed during normal processing.
+
+#### Delivery is at least once
+
+A task can run more than once:
+
+- Its worker stopped halfway (a crash, deploy or restart), so it runs again from the start.
+- Its lease expired while the original worker was still running it, for example because the event loop was blocked for longer than `leaseMs`. Another worker then starts it while the first is still busy.
+
+Handlers should be safe to repeat. Choose a `leaseMs` well above your longest event-loop stall.
 
 ### Read-only replicas
 
@@ -299,7 +318,7 @@ await queue.whenIdle(); // running tasks have finished; nothing new starts
 
 Close the queue: pause it, stop its timers, wait for running tasks to finish, then close the database connection.
 
-- `timeout` (ms, default: no limit) caps the wait. If it runs out, the connection is closed anyway and a warning names how many tasks were still running. Those tasks stay `processing` in the database and are restarted later (see [Interrupted tasks](#interrupted-tasks)).
+- `timeout` (ms, default: no limit) caps the wait. If it runs out, the connection is closed anyway and a warning names how many tasks were still running. Those tasks stay `processing` in the database and are restarted later (see [Leases and interrupted tasks](#leases-and-interrupted-tasks)).
 - Calling `close()` again returns the same promise.
 - After `close()`, `job.add()` throws.
 
@@ -694,7 +713,8 @@ process.on('SIGTERM', async () => {
 
 ## Limitations
 
-- **Single Process**: Designed for single-process applications
+- **Same Machine**: Several processes can share one database file (see [Leases](#leases-and-interrupted-tasks)), but it must be on a filesystem where SQLite locking works, such as a local disk or LiteFS. Network filesystems like NFS aren't supported.
+- **At-Least-Once**: A task can run more than once (see [Delivery is at least once](#delivery-is-at-least-once))
 - **Main Thread**: Not suitable for CPU-intensive tasks
 - **SQLite Concurrency**: Write operations are serialized by SQLite
 - **Memory Usage**: Large task payloads are stored in the database

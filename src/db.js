@@ -6,7 +6,7 @@ import { createLogger } from './logger.js';
  * Version 0 is the unversioned litequu 2.x schema.
  * @type {number}
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Schema migrations, applied in order to databases whose `user_version` is
@@ -18,7 +18,55 @@ export const SCHEMA_VERSION = 1;
 const MIGRATIONS = [
   // 1: the litequu 2.x schema, unchanged; only starts version tracking.
   { version: 1, up: () => {} },
+  // 2: leases. locked_until is an ISO timestamp, like next_retry_at.
+  {
+    version: 2,
+    up: (db) => {
+      addColumn(db, 'locked_by', 'TEXT');
+      addColumn(db, 'locked_until', 'DATETIME');
+    },
+  },
 ];
+
+/**
+ * Adds a column to the queue table unless it already exists.
+ * @param {any} db - The better-sqlite3 connection
+ * @param {string} name - Column name
+ * @param {string} type - Column type
+ * @returns {void}
+ */
+function addColumn(db, name, type) {
+  const columns = db.pragma('table_info(queue)').map((column) => column.name);
+  if (!columns.includes(name)) {
+    db.exec(`ALTER TABLE queue ADD COLUMN ${name} ${type}`);
+  }
+}
+
+/**
+ * SQL condition for tasks that can be claimed: pending tasks, failed tasks
+ * whose retry is due, and processing tasks whose lease is missing or expired
+ * (their worker stopped). Takes the current time twice as parameters.
+ */
+const READY_CONDITION = `(
+  status = 'pending'
+  OR (status = 'failed' AND next_retry_at <= ?)
+  OR (status = 'processing' AND (locked_until IS NULL OR locked_until <= ?))
+)`;
+
+/**
+ * Builds a `job_name IN (...)` filter.
+ * @param {Array<string> | null | undefined} jobNames - Job names, or null for all jobs
+ * @returns {{ sql: string, params: Array<string> }} SQL fragment starting with AND, and its parameters
+ */
+function jobFilter(jobNames) {
+  if (!jobNames || jobNames.length === 0) {
+    return { sql: '', params: [] };
+  }
+  return {
+    sql: ` AND job_name IN (${jobNames.map(() => '?').join(', ')})`,
+    params: [...jobNames],
+  };
+}
 
 /**
  * Returns true for paths that open an in-memory (or temporary) database.
@@ -206,9 +254,11 @@ class Database {
   }
 
   /**
-   * Retrieves pending tasks from the queue, including failed tasks ready for retry.
+   * Retrieves tasks that are ready to run without claiming them: pending
+   * tasks, failed tasks ready for retry, and processing tasks whose lease
+   * expired. The queue itself uses `claimTasks()`.
    * @param {number} [limit=5] - Maximum number of tasks to retrieve
-   * @param {string} [currentTime=new Date().toISOString()] - Current time in ISO format for retry comparison
+   * @param {string} [currentTime=new Date().toISOString()] - Current time in ISO format for retry and lease comparison
    * @param {Array<string>} [jobNames=null] - Optional array of job names to filter by. If null, retrieves tasks for all jobs.
    * @returns {Array<Object>} Array of task objects ready for processing
    */
@@ -218,59 +268,117 @@ class Database {
     jobNames = null
   ) {
     this.initialize();
-
-    let sql = `
-      SELECT * FROM queue 
-      WHERE (status = 'pending' OR (status = 'failed' AND next_retry_at <= ?))
-    `;
-    /** @type {Array<string|number>} */
-    const params = [currentTime];
-
-    // Add job name filter if provided
-    if (jobNames && jobNames.length > 0) {
-      const placeholders = jobNames.map(() => '?').join(', ');
-      sql += ` AND job_name IN (${placeholders})`;
-      params.push(...jobNames);
-    }
-
-    sql += `
-      ORDER BY created_at ASC 
+    const filter = jobFilter(jobNames);
+    return this.all(
+      `
+      SELECT * FROM queue
+      WHERE ${READY_CONDITION}${filter.sql}
+      ORDER BY created_at ASC, id ASC
       LIMIT ?
-    `;
-    params.push(limit);
+    `,
+      [currentTime, currentTime, ...filter.params, limit]
+    );
+  }
 
-    return this.all(sql, params);
+  /**
+   * Atomically claims ready tasks for a worker: marks them `processing` with
+   * the worker's lease in a single `UPDATE ... RETURNING` statement, so two
+   * processes on one file never claim the same task.
+   * @param {number} limit - Maximum number of tasks to claim
+   * @param {string} currentTime - Current time in ISO format
+   * @param {Array<string> | null} jobNames - Job names to claim tasks for, or null for all jobs
+   * @param {{ lockedBy: string, lockedUntil: string }} lease - Worker id and ISO lease expiry
+   * @returns {Array<Object>} The claimed task rows in `created_at, id` order
+   */
+  claimTasks(limit, currentTime, jobNames, { lockedBy, lockedUntil }) {
+    this.initialize();
+    const filter = jobFilter(jobNames);
+    const tasks = this.all(
+      `
+      UPDATE queue
+      SET status = 'processing', locked_by = ?, locked_until = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id IN (
+        SELECT id FROM queue
+        WHERE ${READY_CONDITION}${filter.sql}
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?
+      )
+      RETURNING *
+    `,
+      [lockedBy, lockedUntil, currentTime, currentTime, ...filter.params, limit]
+    );
+    // RETURNING doesn't guarantee order.
+    return tasks.sort((a, b) =>
+      a.created_at === b.created_at
+        ? a.id - b.id
+        : a.created_at < b.created_at
+          ? -1
+          : 1
+    );
+  }
+
+  /**
+   * Extends a running task's lease, if the worker still holds it.
+   * @param {number} id - Task ID
+   * @param {string} lockedBy - Worker id that holds the lease
+   * @param {string} lockedUntil - New ISO lease expiry
+   * @returns {boolean} False if the worker no longer holds the lease
+   */
+  extendLease(id, lockedBy, lockedUntil) {
+    this.initialize();
+    return (
+      this.run(
+        `
+      UPDATE queue SET locked_until = ?
+      WHERE id = ? AND locked_by = ? AND status = 'processing'
+    `,
+        [lockedUntil, id, lockedBy]
+      ).changes > 0
+    );
   }
 
   /**
    * Sets tasks left in `processing` by a process that stopped (crash, deploy,
-   * restart) back to `pending`, so they are picked up again.
+   * restart) back to `pending`, so they are picked up again. Only tasks whose
+   * lease is missing or expired are restarted; a live lease means another
+   * worker is still running the task.
+   * @param {string} [currentTime=new Date().toISOString()] - Current time in ISO format
    * @returns {number} Number of tasks that were restarted
    */
-  recoverInterruptedTasks() {
+  recoverInterruptedTasks(currentTime = new Date().toISOString()) {
     this.initialize();
     return this.run(
       `
       UPDATE queue
-      SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+      SET status = 'pending', locked_by = NULL, locked_until = NULL,
+          updated_at = CURRENT_TIMESTAMP
       WHERE status = 'processing'
-    `
+        AND (locked_until IS NULL OR locked_until <= ?)
+    `,
+      [currentTime]
     ).changes;
   }
 
   /**
    * Retrieves tasks that still have work to do, for copying to another
-   * database: `pending`, `processing`, and `failed` with a scheduled retry.
+   * database: `pending`, `processing` without a live lease, and `failed`
+   * with a scheduled retry.
+   * @param {string} [currentTime=new Date().toISOString()] - Current time in ISO format
    * @returns {Array<Object>} Task rows in `created_at, id` order
    */
-  getOpenTasks() {
+  getOpenTasks(currentTime = new Date().toISOString()) {
     this.initialize();
-    return this.all(`
+    return this.all(
+      `
       SELECT * FROM queue
-      WHERE status IN ('pending', 'processing')
+      WHERE status = 'pending'
+        OR (status = 'processing' AND (locked_until IS NULL OR locked_until <= ?))
         OR (status = 'failed' AND next_retry_at IS NOT NULL)
       ORDER BY created_at ASC, id ASC
-    `);
+    `,
+      [currentTime]
+    );
   }
 
   /**
@@ -304,6 +412,30 @@ class Database {
   }
 
   /**
+   * Retrieves the earliest time a task may become claimable: a scheduled
+   * retry, or the lease expiry of a task another worker is running.
+   * @param {Array<string> | null} [jobNames=null] - Only consider these jobs, or all jobs when null
+   * @returns {string|null} ISO timestamp, or null if nothing is scheduled
+   */
+  getNextWakeTime(jobNames = null) {
+    this.initialize();
+    const filter = jobFilter(jobNames);
+    const row = this.get(
+      `
+      SELECT MIN(at) AS at FROM (
+        SELECT next_retry_at AS at FROM queue
+        WHERE status = 'failed' AND next_retry_at IS NOT NULL${filter.sql}
+        UNION ALL
+        SELECT locked_until AS at FROM queue
+        WHERE status = 'processing' AND locked_until IS NOT NULL${filter.sql}
+      )
+    `,
+      [...filter.params, ...filter.params]
+    );
+    return row?.at || null;
+  }
+
+  /**
    * Retrieves the earliest next_retry_at timestamp among failed tasks.
    * Used to schedule the next wake-up when there are no ready tasks.
    * @returns {string|null} ISO timestamp of the earliest next_retry_at or null if none
@@ -327,18 +459,30 @@ class Database {
    * @param {string} status - New status ('pending', 'processing', 'completed', 'failed')
    * @param {number} [retryCount=0] - Current retry count for the task
    * @param {string|null} [nextRetryAt=null] - ISO timestamp for next retry attempt, or null if no retry scheduled
-   * @returns {Object} Result object with changes count
+   * @param {Object} [options={}] - Update options
+   * @param {string} [options.lockedBy] - Only update if this worker still holds the task's lease
+   * @returns {Object} Result object with changes count (0 if the lease was lost)
    */
-  updateTaskStatus(id, status, retryCount = 0, nextRetryAt = null) {
+  updateTaskStatus(
+    id,
+    status,
+    retryCount = 0,
+    nextRetryAt = null,
+    options = {}
+  ) {
     this.initialize();
-    return this.run(
-      `
-      UPDATE queue 
-      SET status = ?, retry_count = ?, next_retry_at = ?, updated_at = CURRENT_TIMESTAMP
+    const params = [status, retryCount, nextRetryAt, id];
+    let sql = `
+      UPDATE queue
+      SET status = ?, retry_count = ?, next_retry_at = ?,
+          locked_by = NULL, locked_until = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `,
-      [status, retryCount, nextRetryAt, id]
-    );
+    `;
+    if (options.lockedBy !== undefined) {
+      sql += ' AND locked_by = ?';
+      params.push(options.lockedBy);
+    }
+    return this.run(sql, params);
   }
 
   /**

@@ -60,7 +60,9 @@ describe('Schema migrations', () => {
 
     const after = readSchema(file);
     expect(after.version).toBe(SCHEMA_VERSION);
-    expect(after.columns).toEqual(expect.arrayContaining(before.columns));
+    expect(after.columns).toEqual(
+      expect.arrayContaining([...before.columns, 'locked_by', 'locked_until'])
+    );
     expect(after.rows).toHaveLength(3);
     for (const [index, row] of before.rows.entries()) {
       expect(after.rows[index]).toMatchObject(row);
