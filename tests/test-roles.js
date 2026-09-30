@@ -1,14 +1,9 @@
 import { describe, beforeEach, afterEach, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import BetterSqlite3 from 'better-sqlite3';
 import Queue from '../src/queue.js';
-import {
-  QueueReadOnlyError,
-  litefsWritable,
-  sqliteWritable,
-} from '../src/index.js';
+import { QueueReadOnlyError, sqliteWritable } from '../src/index.js';
 import { canWrite } from '../src/roles.js';
 import { createTempDirs } from './helpers/tmp.js';
 import { openRaw } from './helpers/legacy.js';
@@ -177,63 +172,6 @@ describe('Following a writable role', () => {
     const queue = makeQueue();
 
     expect(queue._roleTimer.hasRef()).toBe(false);
-  });
-});
-
-describe('litefsWritable()', () => {
-  const tmp = createTempDirs();
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    tmp.cleanup();
-  });
-
-  it('should be writable when there is no .primary file (this node is primary)', () => {
-    expect(litefsWritable(tmp.make())()).toBe(true);
-  });
-
-  it('should be writable when .primary names this host', () => {
-    const dir = tmp.make();
-    fs.writeFileSync(path.join(dir, '.primary'), `${os.hostname()}\n`);
-
-    expect(litefsWritable(dir)()).toBe(true);
-  });
-
-  it('should be read-only when .primary names another host', () => {
-    const dir = tmp.make();
-    fs.writeFileSync(path.join(dir, '.primary'), 'some-other-machine\n');
-
-    expect(litefsWritable(dir)()).toBe(false);
-  });
-
-  it('should be writable when the directory does not exist', () => {
-    const dir = path.join(tmp.make(), 'missing');
-
-    expect(litefsWritable(dir)()).toBe(true);
-  });
-
-  it('should always be writable when no directory is configured', () => {
-    vi.stubEnv('LITEFS_DIR', undefined);
-
-    expect(litefsWritable()()).toBe(true);
-    expect(litefsWritable(undefined)()).toBe(true);
-  });
-
-  it('should read LITEFS_DIR by default', () => {
-    const dir = tmp.make();
-    fs.writeFileSync(path.join(dir, '.primary'), 'some-other-machine');
-    vi.stubEnv('LITEFS_DIR', dir);
-
-    expect(litefsWritable()()).toBe(false);
-  });
-
-  it('should re-read .primary on every call', () => {
-    const dir = tmp.make();
-    const check = litefsWritable(dir);
-    expect(check()).toBe(true);
-
-    fs.writeFileSync(path.join(dir, '.primary'), 'some-other-machine');
-    expect(check()).toBe(false);
   });
 });
 

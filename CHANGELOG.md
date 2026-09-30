@@ -40,9 +40,9 @@ This release changes some defaults. Read the breaking changes before upgrading f
 - Public `idle` event.
 - `status.paused` and `status.closed`.
 - `queue.switchDatabase(dbPath, { moveOpenTasks, recoverInterrupted })` and the `database-switched` event.
-- Read-only replica support: `writable`, `readOnlyDbPath`, `whenReadOnly` and `roleCheckInterval` options, the `role-change` event, `status.writable` and `status.dbPath`.
+- Read-only replica support: a `writable` callback you supply (litequ doesn't detect roles itself), plus `readOnlyDbPath`, `whenReadOnly` and `roleCheckInterval` options, the `role-change` event, `status.writable` and `status.dbPath`.
 - `QueueReadOnlyError`, thrown by `add()` on a read-only queue with `whenReadOnly: 'throw'`.
-- `litefsWritable(dir)` and `sqliteWritable(dbPath)` role checks.
+- `sqliteWritable(dbPath)`, a generic `writable` callback that probes the database file.
 - `leaseMs` option, `queue.instanceId`, lease heartbeats.
 - `Queue.shared(options)`: one queue per key per process, shared across module copies through `globalThis[Symbol.for('litequ.registry')]`.
 - `job.add(data, { dedupeKey, throttleMs })` throttles in the database and returns `null` for a dropped task. It uses schema version 3, which adds the `dedupe_key` column and an index on `(job_name, dedupe_key, created_at)`.
