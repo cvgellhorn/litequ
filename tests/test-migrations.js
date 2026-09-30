@@ -17,6 +17,7 @@ describe('Schema migrations', () => {
       return {
         version: raw.pragma('user_version', { simple: true }),
         columns: raw.pragma('table_info(queue)').map((column) => column.name),
+        indexes: raw.pragma('index_list(queue)').map((index) => index.name),
         rows: raw.prepare('SELECT * FROM queue ORDER BY id').all(),
       };
     } finally {
@@ -61,8 +62,14 @@ describe('Schema migrations', () => {
     const after = readSchema(file);
     expect(after.version).toBe(SCHEMA_VERSION);
     expect(after.columns).toEqual(
-      expect.arrayContaining([...before.columns, 'locked_by', 'locked_until'])
+      expect.arrayContaining([
+        ...before.columns,
+        'locked_by',
+        'locked_until',
+        'dedupe_key',
+      ])
     );
+    expect(after.indexes).toContain('idx_dedupe');
     expect(after.rows).toHaveLength(3);
     for (const [index, row] of before.rows.entries()) {
       expect(after.rows[index]).toMatchObject(row);

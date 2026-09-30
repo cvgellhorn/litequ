@@ -6,7 +6,7 @@ import { createLogger } from './logger.js';
  * Version 0 is the unversioned litequu 2.x schema.
  * @type {number}
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * Schema migrations, applied in order to databases whose `user_version` is
@@ -26,7 +26,28 @@ const MIGRATIONS = [
       addColumn(db, 'locked_until', 'DATETIME');
     },
   },
+  // 3: throttling by dedupe key.
+  {
+    version: 3,
+    up: (db) => {
+      addColumn(db, 'dedupe_key', 'TEXT');
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_dedupe ON queue (job_name, dedupe_key, created_at)'
+      );
+    },
+  },
 ];
+
+/**
+ * Formats a time like SQLite's CURRENT_TIMESTAMP (UTC), with milliseconds:
+ * `YYYY-MM-DD HH:MM:SS.SSS`. Values sort correctly next to second-precision
+ * CURRENT_TIMESTAMP values from older rows.
+ * @param {number} [ms=Date.now()] - Milliseconds since the epoch
+ * @returns {string} The formatted timestamp
+ */
+export function sqliteTimestamp(ms = Date.now()) {
+  return new Date(ms).toISOString().replace('T', ' ').slice(0, 23);
+}
 
 /**
  * Adds a column to the queue table unless it already exists.
@@ -239,18 +260,47 @@ class Database {
   }
 
   /**
-   * Inserts a new task into the queue.
+   * Inserts a new task into the queue. `created_at` is taken from the
+   * JavaScript clock with millisecond precision.
+   *
+   * With both `dedupeKey` and `throttleMs`, the insert is skipped when a task
+   * with the same job name and dedupe key was created within the last
+   * `throttleMs` milliseconds. The check and the insert run in one write
+   * transaction, so concurrent processes can't both pass the check.
    * @param {string} jobName - Name of the job/worker that will process this task
    * @param {string} taskData - JSON string representation of the task data
-   * @returns {number} The ID of the newly inserted task
+   * @param {Object} [options={}] - Insert options
+   * @param {string} [options.dedupeKey] - Key stored with the task for throttling
+   * @param {number} [options.throttleMs] - Skip the insert if a task with the same key was created this recently
+   * @returns {number|null} The ID of the newly inserted task, or null if it was throttled
    */
-  insertTask(jobName, taskData) {
+  insertTask(jobName, taskData, options = {}) {
     this.initialize();
-    const result = this.run(
-      'INSERT INTO queue (job_name, task_data) VALUES (?, ?)',
-      [jobName, taskData]
-    );
-    return result.lastID;
+    const { dedupeKey = null, throttleMs } = options;
+    const now = Date.now();
+    const insert = () =>
+      this.run(
+        'INSERT INTO queue (job_name, task_data, dedupe_key, created_at) VALUES (?, ?, ?, ?)',
+        [jobName, taskData, dedupeKey, sqliteTimestamp(now)]
+      ).lastID;
+
+    if (dedupeKey === null || !throttleMs) {
+      return /** @type {number} */ (insert());
+    }
+
+    return this.db
+      .transaction(() => {
+        const recent = this.get(
+          `
+          SELECT 1 FROM queue
+          WHERE job_name = ? AND dedupe_key = ? AND created_at > ?
+          LIMIT 1
+        `,
+          [jobName, dedupeKey, sqliteTimestamp(now - throttleMs)]
+        );
+        return recent ? null : insert();
+      })
+      .immediate();
   }
 
   /**
@@ -384,15 +434,16 @@ class Database {
   /**
    * Inserts tasks copied from another database in one transaction. They get
    * new ids; `processing` tasks are inserted as `pending`, failed tasks keep
-   * their scheduled retry.
+   * their scheduled retry. `created_at` and `dedupe_key` are kept, so
+   * ordering and throttling carry over.
    * @param {Array<Object>} tasks - Rows from `getOpenTasks()`
    * @returns {number} Number of tasks inserted
    */
   importTasks(tasks) {
     this.initialize();
     const insert = this.db.prepare(`
-      INSERT INTO queue (job_name, task_data, status, retry_count, next_retry_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO queue (job_name, task_data, status, retry_count, next_retry_at, created_at, dedupe_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
     this.db
       .transaction(() => {
@@ -403,7 +454,8 @@ class Database {
             task.status === 'failed' ? 'failed' : 'pending',
             task.retry_count,
             task.next_retry_at,
-            task.created_at
+            task.created_at,
+            task.dedupe_key ?? null
           );
         }
       })

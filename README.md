@@ -388,9 +388,9 @@ await queue.close({ timeout: 4000 });
 
 ### Job Methods
 
-#### `job.add(taskData)`
+#### `job.add(taskData, { dedupeKey, throttleMs })`
 
-Add a task to a specific job.
+Add a task to a specific job. Returns the new task's id.
 
 ```javascript
 const emailJob = queue.createJob('email');
@@ -399,6 +399,24 @@ const taskId = emailJob.add({
   subject: 'Welcome!',
 });
 ```
+
+To throttle, pass both `dedupeKey` (a string) and `throttleMs`. If a task of the same job with the same `dedupeKey` was created within the last `throttleMs` milliseconds, the new task is dropped, `add()` returns `null`, and no `added` event fires.
+
+```javascript
+// At most one digest per user per hour
+const id = digestJob.add(
+  { userId },
+  { dedupeKey: `user:${userId}`, throttleMs: 60 * 60 * 1000 }
+);
+if (id === null) {
+  // throttled
+}
+```
+
+- The check runs against the database, in the same write transaction as the insert. Throttling therefore survives restarts and holds across processes that share the file.
+- Tasks of any status count, including completed ones. Throttling windows longer than your `cleanup()` age can't see tasks that were already deleted.
+- `dedupeKey` alone just stores the key, which later throttled adds compare against. `throttleMs` alone is ignored.
+- Timestamps have millisecond precision, so windows under a second work.
 
 #### `job.process(handler)`
 

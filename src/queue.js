@@ -104,13 +104,32 @@ class Job extends EventEmitter {
 
   /**
    * Adds a new task to this job's queue.
+   *
+   * With `dedupeKey` and `throttleMs`, the task is dropped (and `null`
+   * returned) if a task of this job with the same key was created within the
+   * last `throttleMs` milliseconds. The check uses the database, so it
+   * survives restarts and holds across processes sharing the file.
    * @param {*} taskData - The data for the task (will be JSON serialized)
-   * @returns {number} The ID of the newly added task
+   * @param {Object} [options={}] - Add options
+   * @param {string} [options.dedupeKey] - Key identifying tasks to throttle together; stored with the task
+   * @param {number} [options.throttleMs] - Throttle window in milliseconds; needs `dedupeKey`
+   * @returns {number|null} The ID of the newly added task, or null if it was throttled
    * @throws {Error} When task insertion fails or the queue is closed
    * @throws {QueueReadOnlyError} When the queue is read-only and `whenReadOnly` is `'throw'`
+   * @throws {TypeError} When `dedupeKey` is not a string or `throttleMs` is not a positive number
    * @fires Job#added
    */
-  add(taskData) {
+  add(taskData, options = {}) {
+    const { dedupeKey, throttleMs } = options;
+    if (dedupeKey !== undefined && typeof dedupeKey !== 'string') {
+      throw new TypeError('dedupeKey must be a string');
+    }
+    if (
+      throttleMs !== undefined &&
+      (typeof throttleMs !== 'number' || !(throttleMs > 0))
+    ) {
+      throw new TypeError('throttleMs must be a positive number');
+    }
     if (this.queue.closed) {
       throw new Error(
         `litequ: cannot add a task to job "${this.name}" because the queue is closed`
@@ -125,8 +144,12 @@ class Job extends EventEmitter {
     try {
       const taskId = this.queue.db.insertTask(
         this.name,
-        JSON.stringify(taskData)
+        JSON.stringify(taskData),
+        { dedupeKey, throttleMs }
       );
+      if (taskId === null) {
+        return null;
+      }
 
       // Emit on this job instance
       this.emit('added', { taskId, taskData });
