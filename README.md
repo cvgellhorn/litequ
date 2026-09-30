@@ -25,7 +25,7 @@ A simple, persistent task queue for Node.js using SQLite as storage. Tasks are p
 npm i litequ
 ```
 
-Upgrading from `litequ` 1.x or `@sturmfrei/litequu` 2.x? Some defaults changed in 3.0.0, see the [changelog](CHANGELOG.md).
+Upgrading from `litequ` 1.x or `@sturmfrei/litequu` 2.x? Some defaults changed in 2.0.0, see the [changelog](CHANGELOG.md).
 
 ## Quick Start
 
@@ -152,7 +152,7 @@ This is what makes it safe to run several processes, or several `Queue` instance
 - A task whose lease has expired counts as abandoned: its worker crashed, was killed, or hung without renewing. Any queue with a handler for that job claims it again, with no restart needed. The queue schedules a wake-up for the moment another worker's lease runs out.
 - If a worker finishes a task after another worker took it over, its result isn't saved. It logs a warning and emits no event for that task.
 
-With `recoverInterrupted: true` (the default), opening a file database also sets tasks left in `processing` back to `pending`, but only if their lease is missing or expired. A task with a live lease belongs to another worker that is still running it, and it's left alone. Rows from 2.x files have no lease and are restarted. The count is logged through `logger.info`. Set `recoverInterrupted: false` to skip this step. Expired tasks are still claimed during normal processing.
+With `recoverInterrupted: true` (the default), opening a file database also sets tasks left in `processing` back to `pending`, but only if their lease is missing or expired. A task with a live lease belongs to another worker that is still running it, and it's left alone. Rows from files written by older versions have no lease and are restarted. The count is logged through `logger.info`. Set `recoverInterrupted: false` to skip this step. Expired tasks are still claimed during normal processing.
 
 #### Delivery is at least once
 

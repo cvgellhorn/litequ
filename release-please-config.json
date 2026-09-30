@@ -5,7 +5,6 @@
     ".": {
       "release-type": "node",
       "package-name": "litequ",
-      "release-as": "3.0.0",
       "include-component-in-tag": false,
       "changelog-path": "CHANGELOG.md"
     }

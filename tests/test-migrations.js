@@ -34,7 +34,7 @@ describe('Schema migrations', () => {
     expect(readSchema(file).version).toBe(SCHEMA_VERSION);
   });
 
-  it('should migrate a 2.x database file and keep its rows', async () => {
+  it('should migrate an unversioned (litequu 2.x / litequ 1.x) file and keep its rows', async () => {
     const file = tmp.dbFile();
     const retryAt = new Date(Date.now() + 60_000).toISOString();
     createLegacyDatabase(file, [
