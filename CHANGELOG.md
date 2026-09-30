@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.0.0](https://github.com/cvgellhorn/litequ/compare/v1.0.0...v2.0.0) (2026-09-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* existing database files are migrated to schema version 2 (new lease columns). Interrupted tasks with a live lease are no longer restarted on open. Delivery is at least once.
+* add() after close() throws, and a closed Database no longer reopens its connection on the next call.
+* tasks left in 'processing' are restarted by default instead of staying stuck. Set recoverInterrupted: false for the old behavior.
+* dbPath defaults to ':memory:' instead of './queue.db'. Pass a file path to persist tasks.
+
+### Features
+
+* add pause, resume, whenIdle and close({ timeout }) ([df1add3](https://github.com/cvgellhorn/litequ/commit/df1add393c4d068a6d94026a79a6269f30b9fd55))
+* add public queue.processOnce() ([8098ecd](https://github.com/cvgellhorn/litequ/commit/8098ecd84b4c35e481a6d788d62873dd3e6a1906))
+* add Queue.shared() and queue.defineJob() ([ce239f4](https://github.com/cvgellhorn/litequ/commit/ce239f4da88823e56c2b1e51fda1f0a6538c0778))
+* claim tasks with leases instead of a blanket reset ([33f8631](https://github.com/cvgellhorn/litequ/commit/33f8631619a20d6a169c3120ff2facc7d4213ae1))
+* default to in-memory db, add busyTimeout, logger and schema versioning ([5a16802](https://github.com/cvgellhorn/litequ/commit/5a1680289afafbd1e8944398295c259714da2026))
+* restart interrupted tasks when a file database is opened ([74f4730](https://github.com/cvgellhorn/litequ/commit/74f4730730faed0176db64de820a231298de58bc))
+* switch databases and follow a read-only role ([5cf2ea9](https://github.com/cvgellhorn/litequ/commit/5cf2ea9cd5dc81b2d712a16c4939808fd98a4548))
+* throttle tasks in the database with dedupeKey and throttleMs ([3ac9f3d](https://github.com/cvgellhorn/litequ/commit/3ac9f3d05c94ea8c720cc7d8f7999ba1d65db44e))
+
+
+### Bug Fixes
+
+* compare the cleanup cutoff in SQLite's timestamp format ([d5db3a3](https://github.com/cvgellhorn/litequ/commit/d5db3a31fc9d302d19f72f9535248521a5ad6594))
+
 ## 2.0.0 (unreleased)
 
 This release changes some defaults. Read the breaking changes before upgrading from `litequ` 1.x or from `@sturmfrei/litequu`.
