@@ -9,6 +9,54 @@ import { createLogger } from './logger.js';
 const WHEN_READ_ONLY = ['memory', 'throw'];
 
 /**
+ * Key of the registry `Queue.shared()` keeps on `globalThis`. `Symbol.for`
+ * returns the same symbol in every copy of this module, so copies loaded
+ * from different bundles share one registry.
+ */
+const REGISTRY_KEY = Symbol.for('litequ.registry');
+
+/**
+ * Callbacks `defineJob()` can register, keyed by the event they listen to.
+ * @type {Array<[string, string]>}
+ */
+const DEFINED_CALLBACKS = [
+  ['onCompleted', 'completed'],
+  ['onFailed', 'failed'],
+  ['onRetried', 'retried'],
+];
+
+/**
+ * Returns the shared-queue registry, creating it on first use.
+ * @returns {Map<string, any>} Registry of shared queues by key
+ */
+function sharedRegistry() {
+  globalThis[REGISTRY_KEY] ??= new Map();
+  return globalThis[REGISTRY_KEY];
+}
+
+/**
+ * Lists option names whose primitive values differ between two option
+ * objects. Functions and objects (such as `writable` or `logger`) are not
+ * compared, because every module copy creates its own.
+ * @param {Object} a - First options
+ * @param {Object} b - Second options
+ * @returns {Array<string>} Names of differing options
+ */
+function differingOptions(a, b) {
+  const isComparable = (value) =>
+    value === null ||
+    (typeof value !== 'object' && typeof value !== 'function');
+  const names = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...names].filter(
+    (name) =>
+      name !== 'key' &&
+      isComparable(a[name]) &&
+      isComparable(b[name]) &&
+      a[name] !== b[name]
+  );
+}
+
+/**
  * Job class representing a named worker type with its own processor function.
  * Extends EventEmitter to provide event-based notifications for job-specific task lifecycle events.
  *
@@ -29,6 +77,7 @@ class Job extends EventEmitter {
     this.queue = queue;
     this.name = name;
     this.handler = null;
+    this._definedListeners = new Map(); // event -> listener added by defineJob()
   }
 
   /**
@@ -101,6 +150,29 @@ class Job extends EventEmitter {
     } catch (error) {
       this.queue._emitError({ error, operation: 'add', jobName: this.name });
       throw error;
+    }
+  }
+
+  /**
+   * Replaces the listeners registered by `defineJob()`. Listeners added with
+   * plain `job.on()` are left alone.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {Object<string, Function | undefined>} callbacks - Listener per event; undefined removes it
+   * @returns {void}
+   */
+  _replaceDefinedListeners(callbacks) {
+    this._definedListeners ??= new Map();
+    for (const [event, callback] of Object.entries(callbacks)) {
+      const previous = this._definedListeners.get(event);
+      if (previous) {
+        this.off(event, previous);
+        this._definedListeners.delete(event);
+      }
+      if (callback) {
+        const listener = (data) => callback({ ...data, jobName: this.name });
+        this.on(event, listener);
+        this._definedListeners.set(event, listener);
+      }
     }
   }
 
@@ -208,7 +280,95 @@ class Queue extends EventEmitter {
     this._switchChain = Promise.resolve(); // serializes switchDatabase() calls
     this._roleSwitching = false;
     this._roleTimer = null;
+    this._sharedKey = undefined; // registry key when created by Queue.shared()
+    this._sharedOptions = undefined;
     this._startRoleCheck();
+  }
+
+  /**
+   * Returns the queue registered under a key, creating it on the first call.
+   * The registry lives on `globalThis`, so every copy of litequ in a process
+   * (for example one per server bundle) gets the same instance. Closing a
+   * shared queue removes it from the registry.
+   *
+   * If a later call passes different options for the same key, a warning is
+   * logged and the existing instance is returned unchanged. Only primitive
+   * option values are compared.
+   * @param {Object} [options={}] - Queue options, plus `key`
+   * @param {string} [options.key] - Registry key; defaults to the resolved `dbPath`, and is required for an in-memory database
+   * @returns {Queue} The shared queue
+   * @throws {TypeError} When an in-memory database has no `key`
+   */
+  static shared(options = {}) {
+    const dbPath = options.dbPath || ':memory:';
+    let key = options.key;
+    if (key === undefined || key === null) {
+      if (isMemoryPath(dbPath)) {
+        throw new TypeError(
+          'Queue.shared() needs options.key for an in-memory database'
+        );
+      }
+      key = path.resolve(dbPath);
+    }
+
+    const registry = sharedRegistry();
+    const existing = registry.get(key);
+    if (existing) {
+      const differences = differingOptions(
+        existing._sharedOptions ?? {},
+        options
+      );
+      if (differences.length > 0) {
+        existing.logger.warn(
+          `litequ: Queue.shared() for ${key} was called again with different options (${differences.join(', ')}); returning the existing queue`
+        );
+      }
+      return existing;
+    }
+
+    const queue = new this(options);
+    queue._sharedKey = key;
+    queue._sharedOptions = { ...options };
+    registry.set(key, queue);
+    return queue;
+  }
+
+  /**
+   * Creates or updates a job declaratively. Calling it again for the same
+   * name replaces the handler and the callbacks the previous call
+   * registered, so running the same definition from several module copies
+   * never adds duplicate listeners. Listeners added with `job.on()` are not
+   * touched. Callbacks receive the job-level event payload plus `jobName`.
+   * @param {string} name - Name of the job type
+   * @param {Object} [definition={}] - Job definition
+   * @param {(taskData: any) => any} [definition.handler] - Task handler; registered with `job.process()`
+   * @param {(event: Object) => void} [definition.onCompleted] - Called for each completed task
+   * @param {(event: Object) => void} [definition.onFailed] - Called when a task fails for good
+   * @param {(event: Object) => void} [definition.onRetried] - Called when a task is scheduled for a retry
+   * @returns {Job} The job
+   * @throws {TypeError} When the handler or a callback is not a function
+   */
+  defineJob(name, definition = {}) {
+    const fields = ['handler', ...DEFINED_CALLBACKS.map(([field]) => field)];
+    for (const field of fields) {
+      const value = definition[field];
+      if (value !== undefined && typeof value !== 'function') {
+        throw new TypeError(`defineJob(): ${field} must be a function`);
+      }
+    }
+
+    const job = this.createJob(name);
+    job._replaceDefinedListeners(
+      Object.fromEntries(
+        DEFINED_CALLBACKS.map(([field, event]) => [event, definition[field]])
+      )
+    );
+    if (definition.handler) {
+      job.process(definition.handler).catch((error) => {
+        this._emitError({ error, operation: 'process', jobName: name });
+      });
+    }
+    return job;
   }
 
   /**
@@ -1071,6 +1231,14 @@ class Queue extends EventEmitter {
    * @returns {Promise<void>} Promise that resolves when the queue is closed
    */
   async _close({ timeout } = {}) {
+    const registry = globalThis[REGISTRY_KEY];
+    if (
+      this._sharedKey !== undefined &&
+      registry?.get(this._sharedKey) === this
+    ) {
+      registry.delete(this._sharedKey);
+    }
+
     this.pause();
     this.closed = true;
     this._stopTimers();

@@ -42,4 +42,6 @@ This release changes some defaults. Read the breaking changes before upgrading f
 - `QueueReadOnlyError`, thrown by `add()` on a read-only queue with `whenReadOnly: 'throw'`.
 - `litefsWritable(dir)` and `sqliteWritable(dbPath)` role checks.
 - `leaseMs` option, `queue.instanceId`, lease heartbeats.
+- `Queue.shared(options)`: one queue per key per process, shared across module copies through `globalThis[Symbol.for('litequ.registry')]`.
+- `queue.defineJob(name, { handler, onCompleted, onFailed, onRetried })`, which replaces its earlier handler and callbacks instead of adding duplicates.
 - `Database.claimTasks()`, `Database.extendLease()` and `Database.getNextWakeTime()`.

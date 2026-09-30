@@ -205,6 +205,41 @@ await queue.switchDatabase('/data/queue.db', {
 
 Concurrent calls run one after another. Calling it after `close()` rejects.
 
+### LiteFS
+
+This setup runs litequ on Fly.io with LiteFS. There is one writable primary and several read-only replicas, and the queue file sits on the replicated mount:
+
+```js
+import Queue, { litefsWritable } from 'litequ';
+
+const queue = Queue.shared({
+  dbPath: process.env.QUEUE_DATABASE_PATH,
+  writable: litefsWritable(process.env.LITEFS_DIR),
+  whenReadOnly: 'memory',
+  busyTimeout: 5000,
+  logger,
+});
+
+queue.defineJob('verify_email', {
+  handler: sendVerificationEmail,
+  onFailed: (event) => report(event),
+});
+
+process.once('SIGINT', () => queue.close({ timeout: 4000 }));
+```
+
+What each piece does:
+
+- **`Queue.shared`** gives every bundle in the server build the same queue, so the file has one connection and one worker loop per process.
+- **`litefsWritable`** checks LiteFS's `.primary` file every `roleCheckInterval` (10 s).
+  - The primary works on the file.
+  - A replica keeps new tasks in memory and processes them there.
+  - When a replica is promoted, its open tasks move into the file.
+  - When the primary is demoted, its file tasks stay for the new primary.
+  - Without `LITEFS_DIR` (local development, tests), the queue is always writable.
+- **`defineJob`** can run once per bundle without stacking duplicate `onFailed` listeners.
+- **`close({ timeout })`** lets running tasks finish before the machine stops. A task that is still running when the timeout hits keeps its lease. It's picked up again after the lease expires or when the next process opens the file.
+
 ### Logging
 
 litequ never writes to `console` directly. Pass any object with `error`, `warn` and `info` methods, such as a pino or winston logger. Methods are called on your object, so loggers that depend on `this` work. A missing method falls back to the matching `console` method.
@@ -240,6 +275,31 @@ await smsJob.process(async (taskData) => {
   // Process SMS tasks
 });
 ```
+
+#### `defineJob(name, { handler, onCompleted, onFailed, onRetried })`
+
+Create or update a job in one call. Calling `defineJob` again for the same name **replaces** the handler and the callbacks the previous call registered, instead of adding more. That makes it safe to run the same definition from several copies of a module, for example one per server bundle. Listeners you add with plain `job.on(...)` are left alone. Callbacks receive the job-level event payload plus `jobName`. Returns the `Job`.
+
+```javascript
+const job = queue.defineJob('verify_email', {
+  handler: sendVerificationEmail,
+  onCompleted: (event) => log(event.jobName, event.taskId),
+  onFailed: (event) => report(event),
+  onRetried: (event) => log(`retry ${event.retryCount}`),
+});
+```
+
+#### `Queue.shared(options)`
+
+Return one queue per key for the whole process, creating it on the first call. The key is `options.key` if given, otherwise the resolved `dbPath`. An in-memory database needs an explicit `key`.
+
+```javascript
+const queue = Queue.shared({ dbPath: '/data/queue.db' });
+```
+
+- The registry lives on `globalThis[Symbol.for('litequ.registry')]`. Every copy of litequ loaded in the process uses the same one, even copies bundled separately, so they all get the same instance. That means one connection and one worker loop.
+- If a later call passes different options for the same key, the existing instance is returned and a warning is logged. Only primitive values are compared. Functions and objects such as `writable` and `logger` are not, because each module copy creates its own.
+- Closing a shared queue removes it from the registry. The next `Queue.shared()` call creates a new one.
 
 #### `processOnce()`
 
