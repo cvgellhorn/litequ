@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "278accc896602f94ec9d15b03f669089a06bfab6",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "package-name": "litequ",
+      "release-as": "3.0.0",
+      "include-component-in-tag": false,
+      "changelog-path": "CHANGELOG.md"
+    }
+  }
+}
