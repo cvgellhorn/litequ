@@ -30,3 +30,7 @@ This release changes some defaults. Read the breaking changes before upgrading f
 - `queue.close({ timeout })`.
 - Public `idle` event.
 - `status.paused` and `status.closed`.
+- `queue.switchDatabase(dbPath, { moveOpenTasks, recoverInterrupted })` and the `database-switched` event.
+- Read-only replica support: `writable`, `readOnlyDbPath`, `whenReadOnly` and `roleCheckInterval` options, the `role-change` event, `status.writable` and `status.dbPath`.
+- `QueueReadOnlyError`, thrown by `add()` on a read-only queue with `whenReadOnly: 'throw'`.
+- `litefsWritable(dir)` and `sqliteWritable(dbPath)` role checks.

@@ -118,6 +118,12 @@ const queue = new Queue({
   // Restart tasks left in 'processing' by a process that stopped, when a
   // file database is opened (default: true)
   recoverInterrupted: true,
+
+  // Read-only replicas (see "Read-only replicas" below)
+  writable: () => true, // default: none, always writable
+  readOnlyDbPath: ':memory:', // database used while read-only
+  whenReadOnly: 'memory', // or 'throw'
+  roleCheckInterval: 10_000, // ms between writable() checks
 });
 ```
 
@@ -130,6 +136,55 @@ The default database is in memory (`':memory:'`), so nothing is written to disk 
 A task is marked `processing` while its handler runs. If the process dies in the middle (a crash, a deploy, a restart), the task would stay `processing` forever. With `recoverInterrupted: true` (the default), opening a file database sets those tasks back to `pending` and logs how many it restarted through `logger.info`. The tasks then run again once their job has a handler. Set `recoverInterrupted: false` to leave them alone.
 
 This means a task that was interrupted halfway runs again from the start, so handlers should be safe to repeat.
+
+### Read-only replicas
+
+Some deployments have one writable primary and read-only replicas sharing a replicated database file, for example LiteFS on Fly.io. Pass a `writable` function and the queue follows the node's role:
+
+- At construction the queue opens `dbPath` if `writable()` returns true, and `readOnlyDbPath` (default `':memory:'`) otherwise. If `writable()` throws at construction, the queue starts read-only and logs the error.
+- Every `roleCheckInterval` ms (default 10 s) it calls `writable()` again. The timer doesn't keep the process alive and stops on `close()`.
+- When the node becomes writable, the queue switches to `dbPath` and moves its open tasks (from the in-memory database) into the file.
+- When the node becomes read-only, the queue switches to `readOnlyDbPath` and moves nothing. The file's tasks stay there for the new primary.
+- After a switch caused by a role change, the queue emits `role-change` with `{ writable }`.
+- If `writable()` throws during a check, the error is logged and the current role is kept.
+
+`whenReadOnly` decides what `job.add()` does while the node is read-only:
+
+- `'memory'` (default): store the task in `readOnlyDbPath` and process it there. It moves into the file if the node later becomes writable. If the process stops first, the task is lost.
+- `'throw'`: throw a `QueueReadOnlyError` (exported) and store nothing.
+
+`queue.writable` and `status.writable` report the current role, and `status.dbPath` the database in use.
+
+#### Built-in `writable` checks
+
+**`litefsWritable(dir = process.env.LITEFS_DIR)`** reads LiteFS's `.primary` file. LiteFS writes `<dir>/.primary` only on replicas, containing the primary's hostname. The check returns true when the file can't be read (this node is the primary) or when its trimmed contents equal `os.hostname()`. This is the same rule `litefs-js` uses. When `dir` is unset, the check always returns true, so local development and tests work unchanged.
+
+**`sqliteWritable(dbPath)`** probes the file itself. On every call it opens a short-lived connection and creates and drops a scratch table inside a savepoint that is rolled back. It returns false when SQLite answers `SQLITE_READONLY` or `SQLITE_CANTOPEN`. Things to know:
+
+- It takes the write lock briefly on every check. With another writer active it waits up to its own `busyTimeout` (default 1000 ms, `sqliteWritable(dbPath, { busyTimeout })`) and throws on `SQLITE_BUSY`, which keeps the current role.
+- A missing file is created if its directory is writable.
+- It does a real write because `BEGIN IMMEDIATE` alone succeeds on read-only files.
+- It has **not** been verified against a LiteFS replica. LiteFS users should use `litefsWritable`.
+- Neither check uses file permission bits. On FUSE mounts such as LiteFS, they don't reflect whether writes are refused.
+
+#### `switchDatabase(dbPath, { moveOpenTasks, recoverInterrupted })`
+
+The role check uses `switchDatabase`, and you can call it directly:
+
+```javascript
+await queue.switchDatabase('/data/queue.db', {
+  moveOpenTasks: true, // default
+  recoverInterrupted: true, // default
+});
+```
+
+1. It pauses the queue and waits for `whenIdle()`, because a running task writes its result back to the database it came from.
+2. It opens the new database and, with `recoverInterrupted`, restarts its interrupted tasks.
+3. With `moveOpenTasks`, it copies open tasks from the old database: `pending`, `processing` (inserted as `pending`) and `failed` with a scheduled retry. It keeps `job_name`, `task_data`, `retry_count`, `next_retry_at` and `created_at`, and preserves their order. Copied tasks get new ids. The old database keeps its rows.
+4. It closes the old connection, swaps, and resumes, unless the queue was already paused before the call.
+5. It emits `database-switched` with `{ from, to, moved, recovered }`.
+
+Concurrent calls run one after another. Calling it after `close()` rejects.
 
 ### Logging
 
@@ -291,6 +346,8 @@ console.log(status.maxConcurrent); // Maximum concurrent tasks
 console.log(status.isProcessing); // Whether queue is actively processing
 console.log(status.paused); // Whether pause() is in effect
 console.log(status.closed); // Whether close() has been called
+console.log(status.writable); // Whether this process may write to dbPath
+console.log(status.dbPath); // The database currently in use
 console.log(status.jobs); // Object with job names and their handler status
 ```
 
@@ -358,6 +415,18 @@ queue.on('retried', (info) => {
 // Error events (queue operations)
 queue.on('error', (info) => {
   console.error(`Queue error in ${info.operation}:`, info.error);
+});
+
+// switchDatabase() swapped the connection
+queue.on('database-switched', ({ from, to, moved, recovered }) => {
+  console.log(
+    `Switched ${from} -> ${to}, moved ${moved}, restarted ${recovered}`
+  );
+});
+
+// The writable role changed and the queue switched databases
+queue.on('role-change', ({ writable }) => {
+  console.log(writable ? 'Now the writer' : 'Now read-only');
 });
 
 // The queue has finished its work: no batch or task is running.

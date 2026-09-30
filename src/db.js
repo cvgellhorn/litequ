@@ -259,6 +259,51 @@ class Database {
   }
 
   /**
+   * Retrieves tasks that still have work to do, for copying to another
+   * database: `pending`, `processing`, and `failed` with a scheduled retry.
+   * @returns {Array<Object>} Task rows in `created_at, id` order
+   */
+  getOpenTasks() {
+    this.initialize();
+    return this.all(`
+      SELECT * FROM queue
+      WHERE status IN ('pending', 'processing')
+        OR (status = 'failed' AND next_retry_at IS NOT NULL)
+      ORDER BY created_at ASC, id ASC
+    `);
+  }
+
+  /**
+   * Inserts tasks copied from another database in one transaction. They get
+   * new ids; `processing` tasks are inserted as `pending`, failed tasks keep
+   * their scheduled retry.
+   * @param {Array<Object>} tasks - Rows from `getOpenTasks()`
+   * @returns {number} Number of tasks inserted
+   */
+  importTasks(tasks) {
+    this.initialize();
+    const insert = this.db.prepare(`
+      INSERT INTO queue (job_name, task_data, status, retry_count, next_retry_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    this.db
+      .transaction(() => {
+        for (const task of tasks) {
+          insert.run(
+            task.job_name,
+            task.task_data,
+            task.status === 'failed' ? 'failed' : 'pending',
+            task.retry_count,
+            task.next_retry_at,
+            task.created_at
+          );
+        }
+      })
+      .immediate();
+    return tasks.length;
+  }
+
+  /**
    * Retrieves the earliest next_retry_at timestamp among failed tasks.
    * Used to schedule the next wake-up when there are no ready tasks.
    * @returns {string|null} ISO timestamp of the earliest next_retry_at or null if none

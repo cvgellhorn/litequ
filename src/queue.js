@@ -1,6 +1,10 @@
 import { EventEmitter } from 'events';
+import path from 'node:path';
 import Database, { isMemoryPath } from './db.js';
+import { QueueReadOnlyError } from './errors.js';
 import { createLogger } from './logger.js';
+
+const WHEN_READ_ONLY = ['memory', 'throw'];
 
 /**
  * Job class representing a named worker type with its own processor function.
@@ -52,12 +56,18 @@ class Job extends EventEmitter {
    * @param {*} taskData - The data for the task (will be JSON serialized)
    * @returns {number} The ID of the newly added task
    * @throws {Error} When task insertion fails or the queue is closed
+   * @throws {QueueReadOnlyError} When the queue is read-only and `whenReadOnly` is `'throw'`
    * @fires Job#added
    */
   add(taskData) {
     if (this.queue.closed) {
       throw new Error(
         `litequ: cannot add a task to job "${this.name}" because the queue is closed`
+      );
+    }
+    if (!this.queue.writable && this.queue.whenReadOnly === 'throw') {
+      throw new QueueReadOnlyError(
+        `litequ: cannot add a task to job "${this.name}" because this process is read-only`
       );
     }
 
@@ -118,6 +128,8 @@ class Job extends EventEmitter {
  * @fires Queue#retried - When a task is scheduled for retry
  * @fires Queue#error - When an error occurs during queue operations
  * @fires Queue#idle - When the queue has finished its work and nothing is running
+ * @fires Queue#database-switched - When `switchDatabase()` has swapped the connection
+ * @fires Queue#role-change - When the writable role changed and the database was switched
  */
 class Queue extends EventEmitter {
   /**
@@ -132,6 +144,10 @@ class Queue extends EventEmitter {
    * @param {number} [options.busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
    * @param {Partial<import('./logger.js').Logger>} [options.logger=console] - Logger with error, warn and info methods
    * @param {boolean} [options.recoverInterrupted=true] - Restart tasks a stopped process left in `processing` when a file database is opened
+   * @param {import('./roles.js').WritableCheck} [options.writable] - Returns whether this process may write to `dbPath`; when omitted the queue is always writable
+   * @param {string} [options.readOnlyDbPath=':memory:'] - Database used while `writable()` returns false
+   * @param {'memory' | 'throw'} [options.whenReadOnly='memory'] - While read-only, store new tasks in `readOnlyDbPath` (`'memory'`) or make `add()` throw `QueueReadOnlyError` (`'throw'`)
+   * @param {number} [options.roleCheckInterval=10_000] - Milliseconds between `writable()` checks
    */
   constructor(options = {}) {
     super();
@@ -147,6 +163,24 @@ class Queue extends EventEmitter {
 
     this.recoverInterrupted = options.recoverInterrupted !== false;
 
+    this.writablePath = this.dbPath;
+    this.readOnlyDbPath = options.readOnlyDbPath || ':memory:';
+    this.whenReadOnly = options.whenReadOnly ?? 'memory';
+    this.roleCheckInterval = options.roleCheckInterval ?? 10_000;
+    this._writableCheck = options.writable ?? null;
+    if (!WHEN_READ_ONLY.includes(this.whenReadOnly)) {
+      throw new TypeError(
+        `whenReadOnly must be one of ${WHEN_READ_ONLY.join(', ')}; got ${this.whenReadOnly}`
+      );
+    }
+    if (this._writableCheck && typeof this._writableCheck !== 'function') {
+      throw new TypeError('writable must be a function that returns a boolean');
+    }
+
+    // Unsure at startup means read-only: writing to a replica would fail.
+    this.writable = this._evaluateWritable() ?? false;
+    this.dbPath = this.writable ? this.writablePath : this.readOnlyDbPath;
+
     this.db = this._openDatabase(this.dbPath, this.recoverInterrupted).db;
     this.currentRunning = 0;
     this.isProcessing = false;
@@ -161,6 +195,10 @@ class Queue extends EventEmitter {
     this._manualDrains = 0; // processOnce() calls in progress
     this._workSinceIdle = false; // whether any task ran since the last idle event
     this._internal = new EventEmitter(); // internal events, safe from removeAllListeners()
+    this._switchChain = Promise.resolve(); // serializes switchDatabase() calls
+    this._roleSwitching = false;
+    this._roleTimer = null;
+    this._startRoleCheck();
   }
 
   /**
@@ -188,6 +226,181 @@ class Queue extends EventEmitter {
     }
 
     return { db, recovered };
+  }
+
+  /**
+   * Calls the `writable` option.
+   * @private
+   * @returns {boolean | null} The result, true without a check, or null if the check threw
+   */
+  _evaluateWritable() {
+    if (!this._writableCheck) {
+      return true;
+    }
+    try {
+      return Boolean(this._writableCheck());
+    } catch (error) {
+      this.logger.error(
+        'litequ: the writable() check threw; keeping the current role',
+        error
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Starts the timer that re-evaluates `writable()`. The timer doesn't keep
+   * the process alive.
+   * @private
+   * @returns {void}
+   */
+  _startRoleCheck() {
+    if (!this._writableCheck) {
+      return;
+    }
+    this._roleTimer = setInterval(() => {
+      this._checkRole();
+    }, this.roleCheckInterval);
+    this._roleTimer.unref?.();
+  }
+
+  /**
+   * Re-evaluates `writable()` and switches databases when the role changed.
+   * Becoming writable moves open tasks into the file; becoming read-only
+   * moves nothing, leaving the file's tasks for the new writer.
+   * @private
+   * @returns {Promise<void>} Promise that resolves when the check is done
+   * @fires Queue#role-change
+   */
+  async _checkRole() {
+    if (this._roleSwitching || this.closed) {
+      return;
+    }
+
+    const writable = this._evaluateWritable();
+    if (writable === null || writable === this.writable) {
+      return;
+    }
+
+    this._roleSwitching = true;
+    try {
+      await this.switchDatabase(
+        writable ? this.writablePath : this.readOnlyDbPath,
+        { moveOpenTasks: writable }
+      );
+      this.writable = writable;
+      this.emit('role-change', { writable });
+    } catch (error) {
+      if (!this.closed) {
+        this.logger.error(
+          `litequ: switching to the ${writable ? 'writable' : 'read-only'} database failed`,
+          error
+        );
+      }
+    } finally {
+      this._roleSwitching = false;
+    }
+  }
+
+  /**
+   * Moves the queue to another database. Pauses, waits until no task is
+   * running (a running task writes its status back to the database it came
+   * from), opens the new database, copies open tasks over, closes the old
+   * connection and resumes, unless the queue was paused before the call.
+   * Calls are serialized.
+   *
+   * Tasks are copied, not deleted: the old database keeps its rows. Copied
+   * tasks get new ids and keep `job_name`, `task_data`, `retry_count`,
+   * `next_retry_at` and `created_at`; `processing` tasks become `pending`.
+   * @param {string} dbPath - Path of the database to switch to
+   * @param {Object} [options={}] - Switch options
+   * @param {boolean} [options.moveOpenTasks=true] - Copy `pending`, `processing` and scheduled-retry tasks from the old database
+   * @param {boolean} [options.recoverInterrupted=true] - Restart tasks left in `processing` in the new database
+   * @returns {Promise<void>} Promise that resolves after the switch
+   * @throws {Error} When the queue is closed
+   * @fires Queue#database-switched
+   */
+  switchDatabase(dbPath, options = {}) {
+    const run = this._switchChain.then(() =>
+      this._switchDatabase(dbPath, options)
+    );
+    this._switchChain = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /**
+   * Implements `switchDatabase()`.
+   * @private
+   * @param {string} dbPath - Path of the database to switch to
+   * @param {{ moveOpenTasks?: boolean, recoverInterrupted?: boolean }} options - Switch options
+   * @returns {Promise<void>} Promise that resolves after the switch
+   */
+  async _switchDatabase(
+    dbPath,
+    { moveOpenTasks = true, recoverInterrupted = true } = {}
+  ) {
+    const assertOpen = () => {
+      if (this.closed) {
+        throw new Error(
+          'litequ: cannot switch databases because the queue is closed'
+        );
+      }
+    };
+    assertOpen();
+
+    const wasPaused = this.paused;
+    this.pause();
+    try {
+      await this.whenIdle();
+      assertOpen();
+
+      const from = this.dbPath;
+      const { db: newDb, recovered } = this._openDatabase(
+        dbPath,
+        recoverInterrupted
+      );
+
+      // From here to the swap everything is synchronous, so no task can be
+      // added to the old database after it was copied.
+      let moved = 0;
+      if (moveOpenTasks && !this._isSameFile(from, dbPath)) {
+        try {
+          moved = newDb.importTasks(this.db.getOpenTasks());
+        } catch (error) {
+          await newDb.close();
+          throw error;
+        }
+      }
+
+      const oldDb = this.db;
+      this.db = newDb;
+      this.dbPath = dbPath;
+      await oldDb.close();
+
+      this.emit('database-switched', { from, to: dbPath, moved, recovered });
+    } finally {
+      if (!wasPaused) {
+        this.resume();
+      }
+    }
+  }
+
+  /**
+   * Whether two paths name the same database file.
+   * @private
+   * @param {string} a - First path
+   * @param {string} b - Second path
+   * @returns {boolean} True for the same file; in-memory databases are never the same
+   */
+  _isSameFile(a, b) {
+    return (
+      !isMemoryPath(a) &&
+      !isMemoryPath(b) &&
+      path.resolve(a) === path.resolve(b)
+    );
   }
 
   /**
@@ -714,6 +927,10 @@ class Queue extends EventEmitter {
    */
   _stopTimers() {
     this.stopPolling();
+    if (this._roleTimer) {
+      clearInterval(this._roleTimer);
+      this._roleTimer = null;
+    }
   }
 
   /**
@@ -754,7 +971,7 @@ class Queue extends EventEmitter {
 
   /**
    * Gets the current status of the queue.
-   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, paused, closed, and jobs properties
+   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, paused, closed, writable, dbPath, and jobs properties
    */
   get status() {
     const jobsStatus = {};
@@ -771,6 +988,8 @@ class Queue extends EventEmitter {
       autoProcess: this.autoProcess,
       paused: this.paused,
       closed: this.closed,
+      writable: this.writable,
+      dbPath: this.dbPath,
       jobs: jobsStatus,
     };
   }
