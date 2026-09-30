@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import Database from './db.js';
+import Database, { isMemoryPath } from './db.js';
 import { createLogger } from './logger.js';
 
 /**
@@ -124,6 +124,7 @@ class Queue extends EventEmitter {
    * @param {boolean} [options.jitter=true] - Whether to add randomness to retry delays
    * @param {number} [options.busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
    * @param {Partial<import('./logger.js').Logger>} [options.logger=console] - Logger with error, warn and info methods
+   * @param {boolean} [options.recoverInterrupted=true] - Restart tasks a stopped process left in `processing` when a file database is opened
    */
   constructor(options = {}) {
     super();
@@ -137,17 +138,42 @@ class Queue extends EventEmitter {
     this.busyTimeout = options.busyTimeout ?? 5000;
     this.logger = createLogger(options.logger);
 
-    this.db = new Database(this.dbPath, {
-      busyTimeout: this.busyTimeout,
-      logger: this.logger,
-    });
-    this.db.initialize();
+    this.recoverInterrupted = options.recoverInterrupted !== false;
+
+    this.db = this._openDatabase(this.dbPath, this.recoverInterrupted).db;
     this.currentRunning = 0;
     this.isProcessing = false;
     this.jobs = new Map(); // Map of job name -> Job instance
     this.pollingTimer = null; // used as a one-shot wake-up timer
     this._activeBatch = null; // Promise of the batch currently being processed
     this._tasksAddedDuringProcessing = false; // Flag to track if tasks were added while processing
+  }
+
+  /**
+   * Opens and initializes a database, optionally restarting interrupted tasks.
+   * @private
+   * @param {string} dbPath - Path of the database to open
+   * @param {boolean} recoverInterrupted - Whether to restart tasks left in `processing`
+   * @returns {{ db: Database, recovered: number }} The open database and the number of restarted tasks
+   */
+  _openDatabase(dbPath, recoverInterrupted) {
+    const db = new Database(dbPath, {
+      busyTimeout: this.busyTimeout,
+      logger: this.logger,
+    });
+    db.initialize();
+
+    let recovered = 0;
+    if (recoverInterrupted && !isMemoryPath(dbPath)) {
+      recovered = db.recoverInterruptedTasks();
+      if (recovered > 0) {
+        this.logger.info(
+          `litequ: restarted ${recovered} interrupted task(s) in ${dbPath}`
+        );
+      }
+    }
+
+    return { db, recovered };
   }
 
   /**

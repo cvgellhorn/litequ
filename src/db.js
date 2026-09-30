@@ -239,6 +239,22 @@ class Database {
   }
 
   /**
+   * Sets tasks left in `processing` by a process that stopped (crash, deploy,
+   * restart) back to `pending`, so they are picked up again.
+   * @returns {number} Number of tasks that were restarted
+   */
+  recoverInterruptedTasks() {
+    this.initialize();
+    return this.run(
+      `
+      UPDATE queue
+      SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'processing'
+    `
+    ).changes;
+  }
+
+  /**
    * Retrieves the earliest next_retry_at timestamp among failed tasks.
    * Used to schedule the next wake-up when there are no ready tasks.
    * @returns {string|null} ISO timestamp of the earliest next_retry_at or null if none

@@ -114,12 +114,22 @@ const queue = new Queue({
 
   // Where litequ logs errors, warnings and info messages (default: console)
   logger: console,
+
+  // Restart tasks left in 'processing' by a process that stopped, when a
+  // file database is opened (default: true)
+  recoverInterrupted: true,
 });
 ```
 
 ### Persistence
 
 The default database is in memory (`':memory:'`), so nothing is written to disk and tasks disappear when the process exits. Pass a file path as `dbPath` to keep tasks across restarts. File databases use WAL mode.
+
+### Interrupted tasks
+
+A task is marked `processing` while its handler runs. If the process dies in the middle (a crash, a deploy, a restart), the task would stay `processing` forever. With `recoverInterrupted: true` (the default), opening a file database sets those tasks back to `pending` and logs how many it restarted through `logger.info`. The tasks then run again once their job has a handler. Set `recoverInterrupted: false` to leave them alone.
+
+This means a task that was interrupted halfway runs again from the start, so handlers should be safe to repeat.
 
 ### Logging
 

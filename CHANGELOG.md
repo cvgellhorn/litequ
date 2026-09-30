@@ -7,6 +7,7 @@ This release changes some defaults. Read the breaking changes before upgrading f
 ### ⚠ BREAKING CHANGES
 
 - **`dbPath` defaults to `':memory:'`** instead of `'./queue.db'`, for both `Queue` and `Database`. A queue without a `dbPath` no longer creates a file in the working directory, and its tasks don't survive a restart. Pass a file path to keep tasks.
+- **Interrupted tasks are restarted by default.** When a file database is opened, tasks left in `processing` by a process that stopped are set back to `pending` and run again. Set `recoverInterrupted: false` to keep the 2.x behavior, where they stayed stuck.
 
 ### Behavior changes
 
@@ -21,3 +22,4 @@ This release changes some defaults. Read the breaking changes before upgrading f
 - `queue.processOnce()` processes every ready task for jobs with a handler and resolves with the number of tasks attempted. It works with `autoProcess: false`. Passing a handler, as the removed 2.x `processOnce(handler)` did, throws a migration error.
 - `busyTimeout` option.
 - `logger` option: any object with `error`, `warn` and `info` methods.
+- `recoverInterrupted` option (default `true`).
