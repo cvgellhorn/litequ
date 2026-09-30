@@ -1,4 +1,33 @@
 import BetterSqlite3 from 'better-sqlite3';
+import { createLogger } from './logger.js';
+
+/**
+ * Current schema version, stored in `PRAGMA user_version`.
+ * Version 0 is the unversioned litequu 2.x schema.
+ * @type {number}
+ */
+export const SCHEMA_VERSION = 1;
+
+/**
+ * Schema migrations, applied in order to databases whose `user_version` is
+ * below `version`. Each step must be safe to run on a database that already
+ * has its changes, because `CREATE TABLE IF NOT EXISTS` always creates the
+ * baseline table first.
+ * @type {Array<{ version: number, up: (db: any) => void }>}
+ */
+const MIGRATIONS = [
+  // 1: the litequu 2.x schema, unchanged; only starts version tracking.
+  { version: 1, up: () => {} },
+];
+
+/**
+ * Returns true for paths that open an in-memory (or temporary) database.
+ * @param {string} dbPath - Database path
+ * @returns {boolean} Whether the database lives only in memory
+ */
+export function isMemoryPath(dbPath) {
+  return dbPath === ':memory:' || dbPath === '';
+}
 
 /**
  * Database class for managing SQLite operations for the queue system.
@@ -7,17 +36,27 @@ import BetterSqlite3 from 'better-sqlite3';
 class Database {
   /**
    * Creates a new Database instance.
-   * @param {string} [dbPath='./queue.db'] - Path to the SQLite database file
+   * @param {string} [dbPath=':memory:'] - Path to the SQLite database file
+   * @param {Object} [options={}] - Connection options
+   * @param {number} [options.busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
+   * @param {import('./logger.js').Logger} [options.logger] - Logger for connection errors, defaults to console
    */
-  constructor(dbPath = './queue.db') {
+  constructor(dbPath = ':memory:', options = {}) {
     this.dbPath = dbPath;
+    this.busyTimeout = options.busyTimeout ?? 5000;
+    this.logger = createLogger(options.logger);
     this.db = null;
     this.initialized = false;
+
+    if (!Number.isInteger(this.busyTimeout) || this.busyTimeout < 0) {
+      throw new TypeError('busyTimeout must be a non-negative integer');
+    }
   }
 
   /**
    * Creates and returns a database connection.
-   * Implements lazy connection initialization and sets WAL mode for better concurrency.
+   * Implements lazy connection initialization, applies the busy timeout and,
+   * for files, sets WAL mode for better concurrency.
    * @private
    * @returns {BetterSqlite3.Database} The database connection instance
    * @throws {Error} When database connection fails
@@ -26,9 +65,12 @@ class Database {
     if (!this.db) {
       try {
         this.db = new BetterSqlite3(this.dbPath);
-        this.db.pragma('journal_mode = WAL');
+        this.db.pragma(`busy_timeout = ${this.busyTimeout}`);
+        if (!isMemoryPath(this.dbPath)) {
+          this.db.pragma('journal_mode = WAL');
+        }
       } catch (err) {
-        console.error('Database connection error:', err);
+        this.logger.error('litequ: database connection error', err);
         this.db = null;
         throw err;
       }
@@ -88,17 +130,17 @@ class Database {
   }
 
   /**
-   * Initializes the database by creating the queue table and indexes if they don't exist.
+   * Initializes the database: creates the queue table and indexes if they
+   * don't exist, then runs any schema migrations the file still needs.
    * This method is idempotent - it can be called multiple times safely.
    * @returns {void}
    */
   initialize() {
     if (this.initialized) return;
 
-    // Ensure database connection is established
-    this._createConnection();
+    const db = this._createConnection();
 
-    this.run(`
+    db.exec(`
       CREATE TABLE IF NOT EXISTS queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         job_name TEXT NOT NULL,
@@ -108,16 +150,40 @@ class Database {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         next_retry_at DATETIME DEFAULT NULL
-      )
+      );
+      CREATE INDEX IF NOT EXISTS idx_status ON queue (status);
+      CREATE INDEX IF NOT EXISTS idx_next_retry ON queue (next_retry_at);
+      CREATE INDEX IF NOT EXISTS idx_job_name ON queue (job_name);
     `);
 
-    this.run('CREATE INDEX IF NOT EXISTS idx_status ON queue (status)');
-    this.run(
-      'CREATE INDEX IF NOT EXISTS idx_next_retry ON queue (next_retry_at)'
-    );
-    this.run('CREATE INDEX IF NOT EXISTS idx_job_name ON queue (job_name)');
+    this._migrate(db);
 
     this.initialized = true;
+  }
+
+  /**
+   * Applies pending migrations inside a write transaction. The version is
+   * re-read under the lock, so concurrent openers migrate only once.
+   * @private
+   * @param {any} db - The better-sqlite3 connection
+   * @returns {void}
+   */
+  _migrate(db) {
+    if (db.pragma('user_version', { simple: true }) >= SCHEMA_VERSION) {
+      return;
+    }
+
+    db.transaction(() => {
+      const version = db.pragma('user_version', { simple: true });
+      if (version >= SCHEMA_VERSION) return;
+
+      for (const migration of MIGRATIONS) {
+        if (migration.version > version) {
+          migration.up(db);
+        }
+      }
+      db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }).immediate();
   }
 
   /**
@@ -279,7 +345,7 @@ class Database {
           dbToClose.close();
           resolve();
         } catch (err) {
-          console.error('Error closing database:', err);
+          this.logger.error('litequ: error closing database', err);
           resolve();
         }
       } else {

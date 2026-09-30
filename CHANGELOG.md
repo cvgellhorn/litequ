@@ -1,0 +1,23 @@
+# Changelog
+
+## 3.0.0 (unreleased)
+
+This release changes some defaults. Read the breaking changes before upgrading from `litequ` 1.x or `@sturmfrei/litequu` 2.x.
+
+### ⚠ BREAKING CHANGES
+
+- **`dbPath` defaults to `':memory:'`** instead of `'./queue.db'`, for both `Queue` and `Database`. A queue without a `dbPath` no longer creates a file in the working directory, and its tasks don't survive a restart. Pass a file path to keep tasks.
+
+### Behavior changes
+
+- `new Queue()` opens the database, creates the table and runs migrations immediately, instead of on the first `add()` or processing call.
+- The schema version is tracked in `PRAGMA user_version`. Existing 2.x files (version 0) are migrated in place the first time they're opened. Their rows are kept.
+- File databases get `PRAGMA busy_timeout` (default 5000 ms, see `busyTimeout`). In-memory databases no longer try to switch to WAL, which never applied to them.
+- Log output goes through the new `logger` option instead of `console.error`.
+- An `error` event with no `error` listener is now logged through `logger.error`. Before, Node's `EventEmitter` threw it, which surfaced as an unhandled rejection from background processing.
+
+### Features
+
+- `queue.processOnce()` processes every ready task for jobs with a handler and resolves with the number of tasks attempted. It works with `autoProcess: false`. Passing a handler, as the removed 2.x `processOnce(handler)` did, throws a migration error.
+- `busyTimeout` option.
+- `logger` option: any object with `error`, `warn` and `info` methods.

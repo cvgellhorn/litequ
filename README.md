@@ -89,7 +89,8 @@ queue.on('failed', (info) => {
 
 ```javascript
 const queue = new Queue({
-  // Database file path (default: './queue.db')
+  // Database file path (default: ':memory:')
+  // Without a file path, tasks live in memory and are lost on restart.
   dbPath: './my-app-queue.db',
 
   // Maximum concurrent tasks (default: 5)
@@ -106,8 +107,33 @@ const queue = new Queue({
 
   // Add jitter to retry delays (default: true)
   jitter: true,
+
+  // How long to wait for another connection's lock before failing with
+  // SQLITE_BUSY, in milliseconds (default: 5000)
+  busyTimeout: 5000,
+
+  // Where litequ logs errors, warnings and info messages (default: console)
+  logger: console,
 });
 ```
+
+### Persistence
+
+The default database is in memory (`':memory:'`), so nothing is written to disk and tasks disappear when the process exits. Pass a file path as `dbPath` to keep tasks across restarts. File databases use WAL mode.
+
+### Logging
+
+litequ never writes to `console` directly. Pass any object with `error`, `warn` and `info` methods, such as a pino or winston logger. Methods are called on your object, so loggers that depend on `this` work. A missing method falls back to the matching `console` method.
+
+```javascript
+const queue = new Queue({ dbPath: './queue.db', logger: pinoLogger });
+```
+
+If nothing listens for the queue's `error` event, errors from background processing are logged through `logger.error` instead of being thrown.
+
+### Schema versions
+
+litequ stores its schema version in SQLite's `PRAGMA user_version` and migrates older files the first time it opens them. Files created by `@sturmfrei/litequu` 2.x or `litequ` 1.x are upgraded in place and keep their tasks.
 
 ## API Reference
 

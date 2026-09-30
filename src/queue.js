@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import Database from './db.js';
+import { createLogger } from './logger.js';
 
 /**
  * Job class representing a named worker type with its own processor function.
@@ -80,11 +81,7 @@ class Job extends EventEmitter {
 
       return taskId;
     } catch (error) {
-      this.queue.emit('error', {
-        error,
-        operation: 'add',
-        jobName: this.name,
-      });
+      this.queue._emitError({ error, operation: 'add', jobName: this.name });
       throw error;
     }
   }
@@ -119,23 +116,32 @@ class Queue extends EventEmitter {
   /**
    * Creates a new Queue instance.
    * @param {Object} [options={}] - Configuration options for the queue
-   * @param {string} [options.dbPath='./queue.db'] - Path to the SQLite database file
+   * @param {string} [options.dbPath=':memory:'] - Path to the SQLite database file. Use a file path for persistence.
    * @param {number} [options.maxConcurrent=5] - Maximum number of tasks to process concurrently
    * @param {number} [options.maxRetries=15] - Maximum number of retry attempts for failed tasks
    * @param {number} [options.baseRetryDelay=15_000] - Base delay in milliseconds between retries (exponential backoff)
    * @param {boolean} [options.autoProcess=true] - Whether to automatically process tasks when added
    * @param {boolean} [options.jitter=true] - Whether to add randomness to retry delays
+   * @param {number} [options.busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
+   * @param {Partial<import('./logger.js').Logger>} [options.logger=console] - Logger with error, warn and info methods
    */
   constructor(options = {}) {
     super();
-    this.dbPath = options.dbPath || './queue.db';
+    this.dbPath = options.dbPath || ':memory:';
     this.maxConcurrent = options.maxConcurrent || 5;
     this.maxRetries = options.maxRetries || 15;
     this.baseRetryDelay = options.baseRetryDelay || 15_000; // 15 seconds
     this.autoProcess = options.autoProcess !== false; // defaults to true
     this.jitter = options.jitter !== false; // adds randomness to retry delays
 
-    this.db = new Database(this.dbPath);
+    this.busyTimeout = options.busyTimeout ?? 5000;
+    this.logger = createLogger(options.logger);
+
+    this.db = new Database(this.dbPath, {
+      busyTimeout: this.busyTimeout,
+      logger: this.logger,
+    });
+    this.db.initialize();
     this.currentRunning = 0;
     this.isProcessing = false;
     this.jobs = new Map(); // Map of job name -> Job instance
@@ -269,7 +275,7 @@ class Queue extends EventEmitter {
 
       return tasks.length;
     } catch (error) {
-      this.emit('error', { error, operation: 'process' });
+      this._emitError({ error, operation: 'process' });
       return 0;
     } finally {
       this.isProcessing = false;
@@ -342,13 +348,7 @@ class Queue extends EventEmitter {
 
       this.db.updateTaskStatus(task.id, 'failed', retryCount, nextRetryAt);
 
-      let taskData;
-      try {
-        taskData = JSON.parse(task.task_data);
-      } catch (parseError) {
-        console.error('Error parsing task data:', parseError);
-        taskData = { raw: task.task_data };
-      }
+      const taskData = this._parseTaskDataForEvent(task);
 
       const eventData = {
         taskId: task.id,
@@ -369,13 +369,7 @@ class Queue extends EventEmitter {
     } else {
       this.db.updateTaskStatus(task.id, 'failed', retryCount, null);
 
-      let taskData;
-      try {
-        taskData = JSON.parse(task.task_data);
-      } catch (parseError) {
-        console.error('Error parsing task data:', parseError);
-        taskData = { raw: task.task_data };
-      }
+      const taskData = this._parseTaskDataForEvent(task);
 
       const eventData = {
         taskId: task.id,
@@ -389,6 +383,41 @@ class Queue extends EventEmitter {
       } else {
         this.emit('failed', { ...eventData, jobName: task.job_name });
       }
+    }
+  }
+
+  /**
+   * Parses a task's JSON data for an event payload. Invalid JSON is logged
+   * and returned as `{ raw }` so the event can still be emitted.
+   * @private
+   * @param {Object} task - The task row
+   * @returns {*} The parsed task data, or `{ raw: string }`
+   */
+  _parseTaskDataForEvent(task) {
+    try {
+      return JSON.parse(task.task_data);
+    } catch (parseError) {
+      this.logger.error(
+        `litequ: task ${task.id} has invalid JSON task data`,
+        parseError
+      );
+      return { raw: task.task_data };
+    }
+  }
+
+  /**
+   * Emits an `error` event, or logs the error when nobody listens. An `error`
+   * event without listeners would otherwise throw out of the queue.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {{ error: Error, operation: string, jobName?: string }} info - Error details
+   * @returns {void}
+   * @fires Queue#error
+   */
+  _emitError(info) {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', info);
+    } else {
+      this.logger.error(`litequ: ${info.operation} failed`, info.error);
     }
   }
 
