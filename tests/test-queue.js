@@ -184,11 +184,113 @@ describe('Queue', () => {
     });
   });
 
+  describe('processOnce', () => {
+    it('should process ready tasks across jobs and resolve with the count', async () => {
+      const emailJob = queue.createJob('email');
+      const reportJob = queue.createJob('report');
+      const handled = [];
+
+      await emailJob.process(async (data) => handled.push(data.id));
+      await reportJob.process(async (data) => handled.push(data.id));
+      emailJob.add({ id: 1 });
+      reportJob.add({ id: 2 });
+
+      const processed = await queue.processOnce();
+
+      expect(processed).toBe(2);
+      expect(handled.sort()).toEqual([1, 2]);
+    });
+
+    it('should drain more tasks than maxConcurrent without exceeding it', async () => {
+      const smallQueue = new Queue({
+        dbPath: ':memory:',
+        autoProcess: false,
+        maxConcurrent: 2,
+      });
+      const job = smallQueue.createJob('bulk');
+      let running = 0;
+      let peak = 0;
+
+      await job.process(async () => {
+        running++;
+        peak = Math.max(peak, running);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        running--;
+      });
+      const ids = [1, 2, 3, 4, 5].map((n) => job.add({ n }));
+
+      const processed = await smallQueue.processOnce();
+
+      expect(processed).toBe(5);
+      expect(peak).toBeLessThanOrEqual(2);
+      for (const id of ids) {
+        expect(smallQueue.getTask(id).status).toBe('completed');
+      }
+      await smallQueue.close();
+    });
+
+    it('should leave tasks for jobs without a handler pending', async () => {
+      const handledJob = queue.createJob('handled');
+      const orphanJob = queue.createJob('orphan');
+      await handledJob.process(async () => 'ok');
+      const orphanId = orphanJob.add({ n: 1 });
+
+      const processed = await queue.processOnce();
+
+      expect(processed).toBe(0);
+      expect(queue.getTask(orphanId).status).toBe('pending');
+    });
+
+    it('should not run retries before they are due', async () => {
+      const job = queue.createJob('flaky');
+      let attempts = 0;
+      await job.process(async () => {
+        attempts++;
+        throw new Error('fail');
+      });
+      job.add({ n: 1 });
+
+      expect(await queue.processOnce()).toBe(1);
+      expect(await queue.processOnce()).toBe(0);
+      expect(attempts).toBe(1);
+
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(await queue.processOnce()).toBe(1);
+      expect(attempts).toBe(2);
+    });
+
+    it('should not double-process tasks while auto-processing is running', async () => {
+      const autoQueue = new Queue({ dbPath: ':memory:', maxConcurrent: 2 });
+      const job = autoQueue.createJob('auto');
+      const seen = new Map();
+
+      await job.process(async (data) => {
+        seen.set(data.n, (seen.get(data.n) || 0) + 1);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+      const ids = [1, 2, 3, 4].map((n) => job.add({ n }));
+
+      await new Promise((resolve) => setImmediate(resolve));
+      await autoQueue.processOnce();
+
+      expect([...seen.values()].every((count) => count === 1)).toBe(true);
+      for (const id of ids) {
+        expect(autoQueue.getTask(id).status).toBe('completed');
+      }
+      await autoQueue.close();
+    });
+
+    it('should reject a legacy handler argument with a migration hint', async () => {
+      await expect(queue.processOnce(async () => 'ok')).rejects.toThrow(
+        /createJob\(name\)\.process\(handler\)/
+      );
+    });
+  });
+
   describe('legacy API removed', () => {
-    it('should not expose queue.add, queue.process, or queue.processOnce', () => {
+    it('should not expose queue.add or queue.process', () => {
       expect(queue.add).toBeUndefined();
       expect(queue.process).toBeUndefined();
-      expect(queue.processOnce).toBeUndefined();
     });
 
     it('should not expose queue-level handler state', () => {

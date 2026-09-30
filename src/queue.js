@@ -1,5 +1,60 @@
 import { EventEmitter } from 'events';
-import Database from './db.js';
+import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import Database, { isMemoryPath } from './db.js';
+import { QueueReadOnlyError } from './errors.js';
+import { createLogger } from './logger.js';
+
+const WHEN_READ_ONLY = ['memory', 'throw'];
+
+/**
+ * Key of the registry `Queue.shared()` keeps on `globalThis`. `Symbol.for`
+ * returns the same symbol in every copy of this module, so copies loaded
+ * from different bundles share one registry.
+ */
+const REGISTRY_KEY = Symbol.for('litequ.registry');
+
+/**
+ * Callbacks `defineJob()` can register, keyed by the event they listen to.
+ * @type {Array<[string, string]>}
+ */
+const DEFINED_CALLBACKS = [
+  ['onCompleted', 'completed'],
+  ['onFailed', 'failed'],
+  ['onRetried', 'retried'],
+];
+
+/**
+ * Returns the shared-queue registry, creating it on first use.
+ * @returns {Map<string, any>} Registry of shared queues by key
+ */
+function sharedRegistry() {
+  globalThis[REGISTRY_KEY] ??= new Map();
+  return globalThis[REGISTRY_KEY];
+}
+
+/**
+ * Lists option names whose primitive values differ between two option
+ * objects. Functions and objects (such as `writable` or `logger`) are not
+ * compared, because every module copy creates its own.
+ * @param {Object} a - First options
+ * @param {Object} b - Second options
+ * @returns {Array<string>} Names of differing options
+ */
+function differingOptions(a, b) {
+  const isComparable = (value) =>
+    value === null ||
+    (typeof value !== 'object' && typeof value !== 'function');
+  const names = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...names].filter(
+    (name) =>
+      name !== 'key' &&
+      isComparable(a[name]) &&
+      isComparable(b[name]) &&
+      a[name] !== b[name]
+  );
+}
 
 /**
  * Job class representing a named worker type with its own processor function.
@@ -22,6 +77,7 @@ class Job extends EventEmitter {
     this.queue = queue;
     this.name = name;
     this.handler = null;
+    this._definedListeners = new Map(); // event -> listener added by defineJob()
   }
 
   /**
@@ -42,23 +98,58 @@ class Job extends EventEmitter {
 
     // If autoProcess is enabled, trigger processing
     if (this.queue.autoProcess) {
-      return this.queue._processNextBatch();
+      await this.queue._processNextBatch();
     }
   }
 
   /**
    * Adds a new task to this job's queue.
+   *
+   * With `dedupeKey` and `throttleMs`, the task is dropped (and `null`
+   * returned) if a task of this job with the same key was created within the
+   * last `throttleMs` milliseconds. The check uses the database, so it
+   * survives restarts and holds across processes sharing the file.
    * @param {*} taskData - The data for the task (will be JSON serialized)
-   * @returns {number} The ID of the newly added task
-   * @throws {Error} When task insertion fails
+   * @param {Object} [options={}] - Add options
+   * @param {string} [options.dedupeKey] - Key identifying tasks to throttle together; stored with the task
+   * @param {number} [options.throttleMs] - Throttle window in milliseconds; needs `dedupeKey`
+   * @returns {number|null} The ID of the newly added task, or null if it was throttled
+   * @throws {Error} When task insertion fails or the queue is closed
+   * @throws {QueueReadOnlyError} When the queue is read-only and `whenReadOnly` is `'throw'`
+   * @throws {TypeError} When `dedupeKey` is not a string or `throttleMs` is not a positive number
    * @fires Job#added
    */
-  add(taskData) {
+  add(taskData, options = {}) {
+    const { dedupeKey, throttleMs } = options;
+    if (dedupeKey !== undefined && typeof dedupeKey !== 'string') {
+      throw new TypeError('dedupeKey must be a string');
+    }
+    if (
+      throttleMs !== undefined &&
+      (typeof throttleMs !== 'number' || !(throttleMs > 0))
+    ) {
+      throw new TypeError('throttleMs must be a positive number');
+    }
+    if (this.queue.closed) {
+      throw new Error(
+        `litequ: cannot add a task to job "${this.name}" because the queue is closed`
+      );
+    }
+    if (!this.queue.writable && this.queue.whenReadOnly === 'throw') {
+      throw new QueueReadOnlyError(
+        `litequ: cannot add a task to job "${this.name}" because this process is read-only`
+      );
+    }
+
     try {
       const taskId = this.queue.db.insertTask(
         this.name,
-        JSON.stringify(taskData)
+        JSON.stringify(taskData),
+        { dedupeKey, throttleMs }
       );
+      if (taskId === null) {
+        return null;
+      }
 
       // Emit on this job instance
       this.emit('added', { taskId, taskData });
@@ -74,18 +165,37 @@ class Job extends EventEmitter {
         } else {
           // Cancel any scheduled wake since we have immediate work now
           this.queue.stopPolling();
-          setImmediate(() => this.queue._processNextBatch());
+          this.queue._scheduleBatch();
         }
       }
 
       return taskId;
     } catch (error) {
-      this.queue.emit('error', {
-        error,
-        operation: 'add',
-        jobName: this.name,
-      });
+      this.queue._emitError({ error, operation: 'add', jobName: this.name });
       throw error;
+    }
+  }
+
+  /**
+   * Replaces the listeners registered by `defineJob()`. Listeners added with
+   * plain `job.on()` are left alone.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {Object<string, Function | undefined>} callbacks - Listener per event; undefined removes it
+   * @returns {void}
+   */
+  _replaceDefinedListeners(callbacks) {
+    this._definedListeners ??= new Map();
+    for (const [event, callback] of Object.entries(callbacks)) {
+      const previous = this._definedListeners.get(event);
+      if (previous) {
+        this.off(event, previous);
+        this._definedListeners.delete(event);
+      }
+      if (callback) {
+        const listener = (data) => callback({ ...data, jobName: this.name });
+        this.on(event, listener);
+        this._definedListeners.set(event, listener);
+      }
     }
   }
 
@@ -105,6 +215,25 @@ class Job extends EventEmitter {
 }
 
 /**
+ * Options for `new Queue()` and `Queue.shared()`.
+ * @typedef {Object} QueueOptions
+ * @property {string} [dbPath=':memory:'] - Path to the SQLite database file. Use a file path for persistence.
+ * @property {number} [maxConcurrent=5] - Maximum number of tasks to process concurrently
+ * @property {number} [maxRetries=15] - Maximum number of retry attempts for failed tasks
+ * @property {number} [baseRetryDelay=15_000] - Base delay in milliseconds between retries (exponential backoff)
+ * @property {boolean} [autoProcess=true] - Whether to automatically process tasks when added
+ * @property {boolean} [jitter=true] - Whether to add randomness to retry delays
+ * @property {number} [busyTimeout=5000] - Milliseconds to wait for a lock held by another connection
+ * @property {Partial<import('./logger.js').Logger>} [logger=console] - Logger with error, warn and info methods
+ * @property {boolean} [recoverInterrupted=true] - Restart tasks a stopped process left in `processing` when a file database is opened
+ * @property {import('./roles.js').WritableCheck} [writable] - Returns whether this process may write to `dbPath`; when omitted the queue is always writable
+ * @property {string} [readOnlyDbPath=':memory:'] - Database used while `writable()` returns false
+ * @property {'memory' | 'throw'} [whenReadOnly='memory'] - While read-only, store new tasks in `readOnlyDbPath` (`'memory'`) or make `add()` throw `QueueReadOnlyError` (`'throw'`)
+ * @property {number} [roleCheckInterval=10_000] - Milliseconds between `writable()` checks
+ * @property {number} [leaseMs=60_000] - How long a claimed task stays reserved for this queue; renewed every `leaseMs / 3` while the task runs
+ */
+
+/**
  * Queue class for managing and processing background tasks.
  * Extends EventEmitter to provide event-based notifications for task lifecycle events.
  *
@@ -114,33 +243,361 @@ class Job extends EventEmitter {
  * @fires Queue#failed - When a task fails after all retries
  * @fires Queue#retried - When a task is scheduled for retry
  * @fires Queue#error - When an error occurs during queue operations
+ * @fires Queue#idle - When the queue has finished its work and nothing is running
+ * @fires Queue#database-switched - When `switchDatabase()` has swapped the connection
+ * @fires Queue#role-change - When the writable role changed and the database was switched
  */
 class Queue extends EventEmitter {
   /**
    * Creates a new Queue instance.
-   * @param {Object} [options={}] - Configuration options for the queue
-   * @param {string} [options.dbPath='./queue.db'] - Path to the SQLite database file
-   * @param {number} [options.maxConcurrent=5] - Maximum number of tasks to process concurrently
-   * @param {number} [options.maxRetries=15] - Maximum number of retry attempts for failed tasks
-   * @param {number} [options.baseRetryDelay=15_000] - Base delay in milliseconds between retries (exponential backoff)
-   * @param {boolean} [options.autoProcess=true] - Whether to automatically process tasks when added
-   * @param {boolean} [options.jitter=true] - Whether to add randomness to retry delays
+   * @param {QueueOptions} [options={}] - Configuration options for the queue
    */
   constructor(options = {}) {
     super();
-    this.dbPath = options.dbPath || './queue.db';
+    this.dbPath = options.dbPath || ':memory:';
     this.maxConcurrent = options.maxConcurrent || 5;
     this.maxRetries = options.maxRetries || 15;
     this.baseRetryDelay = options.baseRetryDelay || 15_000; // 15 seconds
     this.autoProcess = options.autoProcess !== false; // defaults to true
     this.jitter = options.jitter !== false; // adds randomness to retry delays
 
-    this.db = new Database(this.dbPath);
+    this.busyTimeout = options.busyTimeout ?? 5000;
+    this.logger = createLogger(options.logger);
+
+    this.recoverInterrupted = options.recoverInterrupted !== false;
+    this.leaseMs = options.leaseMs ?? 60_000;
+    if (!Number.isInteger(this.leaseMs) || this.leaseMs <= 0) {
+      throw new TypeError('leaseMs must be a positive integer');
+    }
+    /** Identifies this queue's leases: `${hostname}:${pid}:${random}`. */
+    this.instanceId = `${os.hostname()}:${process.pid}:${crypto.randomBytes(4).toString('hex')}`;
+    this._heartbeats = new Set();
+
+    this.writablePath = this.dbPath;
+    this.readOnlyDbPath = options.readOnlyDbPath || ':memory:';
+    this.whenReadOnly = options.whenReadOnly ?? 'memory';
+    this.roleCheckInterval = options.roleCheckInterval ?? 10_000;
+    this._writableCheck = options.writable ?? null;
+    if (!WHEN_READ_ONLY.includes(this.whenReadOnly)) {
+      throw new TypeError(
+        `whenReadOnly must be one of ${WHEN_READ_ONLY.join(', ')}; got ${this.whenReadOnly}`
+      );
+    }
+    if (this._writableCheck && typeof this._writableCheck !== 'function') {
+      throw new TypeError('writable must be a function that returns a boolean');
+    }
+
+    // Unsure at startup means read-only: writing to a replica would fail.
+    this.writable = this._evaluateWritable() ?? false;
+    this.dbPath = this.writable ? this.writablePath : this.readOnlyDbPath;
+
+    this.db = this._openDatabase(this.dbPath, this.recoverInterrupted).db;
     this.currentRunning = 0;
     this.isProcessing = false;
     this.jobs = new Map(); // Map of job name -> Job instance
     this.pollingTimer = null; // used as a one-shot wake-up timer
+    this._activeBatch = null; // Promise of the batch currently being processed
     this._tasksAddedDuringProcessing = false; // Flag to track if tasks were added while processing
+    this.paused = false;
+    this.closed = false;
+    this._closePromise = null;
+    this._scheduledBatches = 0; // setImmediate batches that haven't started yet
+    this._manualDrains = 0; // processOnce() calls in progress
+    this._workSinceIdle = false; // whether any task ran since the last idle event
+    this._internal = new EventEmitter(); // internal events, safe from removeAllListeners()
+    this._switchChain = Promise.resolve(); // serializes switchDatabase() calls
+    this._roleSwitching = false;
+    this._roleTimer = null;
+    this._sharedKey = undefined; // registry key when created by Queue.shared()
+    this._sharedOptions = undefined;
+    this._startRoleCheck();
+  }
+
+  /**
+   * Returns the queue registered under a key, creating it on the first call.
+   * The registry lives on `globalThis`, so every copy of litequ in a process
+   * (for example one per server bundle) gets the same instance. Closing a
+   * shared queue removes it from the registry.
+   *
+   * If a later call passes different options for the same key, a warning is
+   * logged and the existing instance is returned unchanged. Only primitive
+   * option values are compared.
+   * @param {QueueOptions & { key?: string }} [options={}] - Queue options, plus `key`: the registry key, which defaults to the resolved `dbPath` and is required for an in-memory database
+   * @returns {Queue} The shared queue
+   * @throws {TypeError} When an in-memory database has no `key`
+   */
+  static shared(options = {}) {
+    const dbPath = options.dbPath || ':memory:';
+    let key = options.key;
+    if (key === undefined || key === null) {
+      if (isMemoryPath(dbPath)) {
+        throw new TypeError(
+          'Queue.shared() needs options.key for an in-memory database'
+        );
+      }
+      key = path.resolve(dbPath);
+    }
+
+    const registry = sharedRegistry();
+    const existing = registry.get(key);
+    if (existing) {
+      const differences = differingOptions(
+        existing._sharedOptions ?? {},
+        options
+      );
+      if (differences.length > 0) {
+        existing.logger.warn(
+          `litequ: Queue.shared() for ${key} was called again with different options (${differences.join(', ')}); returning the existing queue`
+        );
+      }
+      return existing;
+    }
+
+    const queue = new this(options);
+    queue._sharedKey = key;
+    queue._sharedOptions = { ...options };
+    registry.set(key, queue);
+    return queue;
+  }
+
+  /**
+   * Creates or updates a job declaratively. Calling it again for the same
+   * name replaces the handler and the callbacks the previous call
+   * registered, so running the same definition from several module copies
+   * never adds duplicate listeners. Listeners added with `job.on()` are not
+   * touched. Callbacks receive the job-level event payload plus `jobName`.
+   * @param {string} name - Name of the job type
+   * @param {Object} [definition={}] - Job definition
+   * @param {(taskData: any) => any} [definition.handler] - Task handler; registered with `job.process()`
+   * @param {(event: Object) => void} [definition.onCompleted] - Called for each completed task
+   * @param {(event: Object) => void} [definition.onFailed] - Called when a task fails for good
+   * @param {(event: Object) => void} [definition.onRetried] - Called when a task is scheduled for a retry
+   * @returns {Job} The job
+   * @throws {TypeError} When the handler or a callback is not a function
+   */
+  defineJob(name, definition = {}) {
+    const fields = ['handler', ...DEFINED_CALLBACKS.map(([field]) => field)];
+    for (const field of fields) {
+      const value = definition[field];
+      if (value !== undefined && typeof value !== 'function') {
+        throw new TypeError(`defineJob(): ${field} must be a function`);
+      }
+    }
+
+    const job = this.createJob(name);
+    job._replaceDefinedListeners(
+      Object.fromEntries(
+        DEFINED_CALLBACKS.map(([field, event]) => [event, definition[field]])
+      )
+    );
+    if (definition.handler) {
+      job.process(definition.handler).catch((error) => {
+        this._emitError({ error, operation: 'process', jobName: name });
+      });
+    }
+    return job;
+  }
+
+  /**
+   * Opens and initializes a database, optionally restarting interrupted tasks.
+   * @private
+   * @param {string} dbPath - Path of the database to open
+   * @param {boolean} recoverInterrupted - Whether to restart tasks left in `processing`
+   * @returns {{ db: Database, recovered: number }} The open database and the number of restarted tasks
+   */
+  _openDatabase(dbPath, recoverInterrupted) {
+    const db = new Database(dbPath, {
+      busyTimeout: this.busyTimeout,
+      logger: this.logger,
+    });
+    db.initialize();
+
+    let recovered = 0;
+    if (recoverInterrupted && !isMemoryPath(dbPath)) {
+      recovered = db.recoverInterruptedTasks();
+      if (recovered > 0) {
+        this.logger.info(
+          `litequ: restarted ${recovered} interrupted task(s) in ${dbPath}`
+        );
+      }
+    }
+
+    return { db, recovered };
+  }
+
+  /**
+   * Calls the `writable` option.
+   * @private
+   * @returns {boolean | null} The result, true without a check, or null if the check threw
+   */
+  _evaluateWritable() {
+    if (!this._writableCheck) {
+      return true;
+    }
+    try {
+      return Boolean(this._writableCheck());
+    } catch (error) {
+      this.logger.error(
+        'litequ: the writable() check threw; keeping the current role',
+        error
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Starts the timer that re-evaluates `writable()`. The timer doesn't keep
+   * the process alive.
+   * @private
+   * @returns {void}
+   */
+  _startRoleCheck() {
+    if (!this._writableCheck) {
+      return;
+    }
+    this._roleTimer = setInterval(() => {
+      this._checkRole();
+    }, this.roleCheckInterval);
+    this._roleTimer.unref?.();
+  }
+
+  /**
+   * Re-evaluates `writable()` and switches databases when the role changed.
+   * Becoming writable moves open tasks into the file; becoming read-only
+   * moves nothing, leaving the file's tasks for the new writer.
+   * @private
+   * @returns {Promise<void>} Promise that resolves when the check is done
+   * @fires Queue#role-change
+   */
+  async _checkRole() {
+    if (this._roleSwitching || this.closed) {
+      return;
+    }
+
+    const writable = this._evaluateWritable();
+    if (writable === null || writable === this.writable) {
+      return;
+    }
+
+    this._roleSwitching = true;
+    try {
+      await this.switchDatabase(
+        writable ? this.writablePath : this.readOnlyDbPath,
+        { moveOpenTasks: writable }
+      );
+      this.writable = writable;
+      this.emit('role-change', { writable });
+    } catch (error) {
+      if (!this.closed) {
+        this.logger.error(
+          `litequ: switching to the ${writable ? 'writable' : 'read-only'} database failed`,
+          error
+        );
+      }
+    } finally {
+      this._roleSwitching = false;
+    }
+  }
+
+  /**
+   * Moves the queue to another database. Pauses, waits until no task is
+   * running (a running task writes its status back to the database it came
+   * from), opens the new database, copies open tasks over, closes the old
+   * connection and resumes, unless the queue was paused before the call.
+   * Calls are serialized.
+   *
+   * Tasks are copied, not deleted: the old database keeps its rows. Copied
+   * tasks get new ids and keep `job_name`, `task_data`, `retry_count`,
+   * `next_retry_at` and `created_at`; `processing` tasks become `pending`.
+   * @param {string} dbPath - Path of the database to switch to
+   * @param {Object} [options={}] - Switch options
+   * @param {boolean} [options.moveOpenTasks=true] - Copy `pending`, `processing` and scheduled-retry tasks from the old database
+   * @param {boolean} [options.recoverInterrupted=true] - Restart tasks left in `processing` in the new database
+   * @returns {Promise<void>} Promise that resolves after the switch
+   * @throws {Error} When the queue is closed
+   * @fires Queue#database-switched
+   */
+  switchDatabase(dbPath, options = {}) {
+    const run = this._switchChain.then(() =>
+      this._switchDatabase(dbPath, options)
+    );
+    this._switchChain = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /**
+   * Implements `switchDatabase()`.
+   * @private
+   * @param {string} dbPath - Path of the database to switch to
+   * @param {{ moveOpenTasks?: boolean, recoverInterrupted?: boolean }} options - Switch options
+   * @returns {Promise<void>} Promise that resolves after the switch
+   */
+  async _switchDatabase(
+    dbPath,
+    { moveOpenTasks = true, recoverInterrupted = true } = {}
+  ) {
+    const assertOpen = () => {
+      if (this.closed) {
+        throw new Error(
+          'litequ: cannot switch databases because the queue is closed'
+        );
+      }
+    };
+    assertOpen();
+
+    const wasPaused = this.paused;
+    this.pause();
+    try {
+      await this.whenIdle();
+      assertOpen();
+
+      const from = this.dbPath;
+      const { db: newDb, recovered } = this._openDatabase(
+        dbPath,
+        recoverInterrupted
+      );
+
+      // From here to the swap everything is synchronous, so no task can be
+      // added to the old database after it was copied.
+      let moved = 0;
+      if (moveOpenTasks && !this._isSameFile(from, dbPath)) {
+        try {
+          moved = newDb.importTasks(this.db.getOpenTasks());
+        } catch (error) {
+          await newDb.close();
+          throw error;
+        }
+      }
+
+      const oldDb = this.db;
+      this.db = newDb;
+      this.dbPath = dbPath;
+      await oldDb.close();
+
+      this.emit('database-switched', { from, to: dbPath, moved, recovered });
+    } finally {
+      if (!wasPaused) {
+        this.resume();
+      }
+    }
+  }
+
+  /**
+   * Whether two paths name the same database file.
+   * @private
+   * @param {string} a - First path
+   * @param {string} b - Second path
+   * @returns {boolean} True for the same file; in-memory databases are never the same
+   */
+  _isSameFile(a, b) {
+    return (
+      !isMemoryPath(a) &&
+      !isMemoryPath(b) &&
+      path.resolve(a) === path.resolve(b)
+    );
   }
 
   /**
@@ -170,21 +627,78 @@ class Queue extends EventEmitter {
   }
 
   /**
-   * Processes the next batch of available tasks.
-   * @internal - This method is part of the internal API between Job and Queue
-   * @returns {Promise<void>} Promise that resolves after batch processing
+   * Processes every task that is ready now, for all jobs with a registered handler.
+   * Runs in batches of up to maxConcurrent and resolves once no ready tasks remain.
+   * Works whether or not autoProcess is enabled; if an automatic batch is in
+   * flight, it waits for that batch first. Retries that are not yet due are left
+   * for a later call. Does nothing while the queue is paused or closed.
+   * @returns {Promise<number>} Number of tasks attempted (completed or failed)
+   * @throws {TypeError} When called with a handler (removed legacy signature)
    * @fires Queue#error
    */
-  async _processNextBatch() {
-    if (this.isProcessing) {
-      return; // Already processing
+  async processOnce(...args) {
+    if (args.length > 0) {
+      throw new TypeError(
+        'processOnce() no longer accepts a handler. Register handlers with ' +
+          'queue.createJob(name).process(handler), then call queue.processOnce().'
+      );
     }
 
+    let processed = 0;
+    this._manualDrains++;
+    try {
+      while (!this.paused && !this.closed) {
+        if (this.isProcessing) {
+          await this._activeBatch;
+          continue;
+        }
+
+        const count = await this._processNextBatch(false);
+        if (count === 0) {
+          break;
+        }
+        processed += count;
+      }
+    } finally {
+      this._manualDrains--;
+      this._checkIdle();
+    }
+    return processed;
+  }
+
+  /**
+   * Processes the next batch of available tasks.
+   * If a batch is already running, returns that batch's promise instead.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {boolean} [continueInBackground=true] - Schedule the next batch when this one was full
+   * @returns {Promise<number>} Promise resolving to the number of tasks in the batch
+   * @fires Queue#error
+   */
+  _processNextBatch(continueInBackground = true) {
+    if (this.paused || this.closed) {
+      return Promise.resolve(0);
+    }
+    if (this.isProcessing) {
+      return this._activeBatch; // Already processing
+    }
+
+    this._activeBatch = this._runBatch(continueInBackground);
+    return this._activeBatch;
+  }
+
+  /**
+   * Fetches and processes one batch of ready tasks.
+   * @private
+   * @param {boolean} continueInBackground - Schedule the next batch when this one was full
+   * @returns {Promise<number>} Promise resolving to the number of tasks in the batch
+   * @fires Queue#error
+   */
+  async _runBatch(continueInBackground) {
     const hasJobHandlers = Array.from(this.jobs.values()).some(
       (job) => job.handler
     );
     if (!hasJobHandlers) {
-      return;
+      return 0;
     }
 
     this.isProcessing = true;
@@ -193,7 +707,7 @@ class Queue extends EventEmitter {
     try {
       const availableSlots = this.maxConcurrent - this.currentRunning;
       if (availableSlots <= 0) {
-        return;
+        return 0;
       }
 
       const now = new Date().toISOString();
@@ -202,32 +716,91 @@ class Queue extends EventEmitter {
         .filter(([, job]) => job.handler)
         .map(([name]) => name);
 
-      const tasks = this.db.getPendingTasks(
+      const tasks = this.db.claimTasks(
         availableSlots,
         now,
-        jobNamesWithHandlers
+        jobNamesWithHandlers,
+        { lockedBy: this.instanceId, lockedUntil: this._leaseExpiry() }
       );
+
+      if (tasks.length > 0) {
+        this._workSinceIdle = true;
+      }
 
       const processingPromises = tasks.map((task) => this._processTask(task));
       await Promise.all(processingPromises);
 
       if (
+        continueInBackground &&
         tasks.length === availableSlots &&
         this.currentRunning < this.maxConcurrent
       ) {
-        setImmediate(() => this._processNextBatch());
+        this._scheduleBatch();
       }
+
+      return tasks.length;
     } catch (error) {
-      this.emit('error', { error, operation: 'process' });
+      this._emitError({ error, operation: 'process' });
+      return 0;
     } finally {
       this.isProcessing = false;
 
       if (this._tasksAddedDuringProcessing) {
         this._tasksAddedDuringProcessing = false;
-        setImmediate(() => this._processNextBatch());
+        this._scheduleBatch();
       } else {
         this._scheduleNextWake();
       }
+
+      this._checkIdle();
+    }
+  }
+
+  /**
+   * Starts a batch on the next turn of the event loop. While it's pending the
+   * queue doesn't count as idle.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @returns {void}
+   */
+  _scheduleBatch() {
+    this._scheduledBatches++;
+    setImmediate(() => {
+      this._scheduledBatches--;
+      this._processNextBatch();
+      this._checkIdle();
+    });
+  }
+
+  /**
+   * Whether no batch, task, scheduled batch or processOnce() call is running.
+   * @private
+   * @returns {boolean} True when the queue is idle
+   */
+  _isIdle() {
+    return (
+      !this.isProcessing &&
+      this.currentRunning === 0 &&
+      this._scheduledBatches === 0 &&
+      this._manualDrains === 0
+    );
+  }
+
+  /**
+   * Emits the internal and public `idle` events if the queue has become idle.
+   * The public event fires only if a task ran since the last one.
+   * @private
+   * @returns {void}
+   * @fires Queue#idle
+   */
+  _checkIdle() {
+    if (!this._isIdle()) {
+      return;
+    }
+
+    this._internal.emit('idle');
+    if (this._workSinceIdle) {
+      this._workSinceIdle = false;
+      this.emit('idle');
     }
   }
 
@@ -239,11 +812,13 @@ class Queue extends EventEmitter {
    * @fires Queue#completed
    */
   async _processTask(task) {
+    // Status updates go to the database the task came from, even if the
+    // queue's connection changes while the handler runs.
+    const db = this.db;
     this.currentRunning++;
+    const heartbeat = this._startHeartbeat(db, task);
 
     try {
-      this.db.updateTaskStatus(task.id, 'processing', task.retry_count, null);
-
       let taskData;
       try {
         taskData = JSON.parse(task.task_data);
@@ -257,14 +832,116 @@ class Queue extends EventEmitter {
       }
 
       const result = await job.handler(taskData);
-      this.db.updateTaskStatus(task.id, 'completed', task.retry_count, null);
+      this._stopHeartbeat(heartbeat);
+      if (this._isResultLost(db, task)) {
+        return;
+      }
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'completed',
+        task.retry_count,
+        null,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
+      }
 
       job._emit('completed', { taskId: task.id, result, taskData });
     } catch (error) {
-      await this._handleTaskFailure(task, error);
+      this._stopHeartbeat(heartbeat);
+      await this._handleTaskFailure(task, error, db);
     } finally {
+      this._stopHeartbeat(heartbeat);
       this.currentRunning--;
     }
+  }
+
+  /**
+   * Returns the ISO expiry for a lease taken or renewed now.
+   * @private
+   * @returns {string} ISO timestamp `leaseMs` from now
+   */
+  _leaseExpiry() {
+    return new Date(Date.now() + this.leaseMs).toISOString();
+  }
+
+  /**
+   * Renews a running task's lease every `leaseMs / 3` so other workers don't
+   * treat it as abandoned. The timer doesn't keep the process alive.
+   * @private
+   * @param {Database} db - The database the task came from
+   * @param {Object} task - The task row
+   * @returns {ReturnType<typeof setInterval>} The heartbeat timer
+   */
+  _startHeartbeat(db, task) {
+    const timer = setInterval(
+      () => {
+        if (db.closed) {
+          this._stopHeartbeat(timer);
+          return;
+        }
+        try {
+          if (!db.extendLease(task.id, this.instanceId, this._leaseExpiry())) {
+            this._stopHeartbeat(timer);
+            this._warnLeaseLost(task);
+          }
+        } catch (error) {
+          this.logger.error(
+            `litequ: failed to renew the lease of task ${task.id}`,
+            error
+          );
+        }
+      },
+      Math.max(1, Math.floor(this.leaseMs / 3))
+    );
+    timer.unref?.();
+    this._heartbeats.add(timer);
+    return timer;
+  }
+
+  /**
+   * Stops a heartbeat timer.
+   * @private
+   * @param {ReturnType<typeof setInterval>} timer - Timer from `_startHeartbeat()`
+   * @returns {void}
+   */
+  _stopHeartbeat(timer) {
+    clearInterval(timer);
+    this._heartbeats.delete(timer);
+  }
+
+  /**
+   * Logs that another worker took over a task after its lease expired, so
+   * this worker's result is not saved.
+   * @private
+   * @param {Object} task - The task row
+   * @returns {void}
+   */
+  _warnLeaseLost(task) {
+    this.logger.warn(
+      `litequ: task ${task.id} (${task.job_name}) lost its lease to another worker; its result was not saved and it may run twice`
+    );
+  }
+
+  /**
+   * Checks whether a task finished after its database was closed, for
+   * example after `close({ timeout })` gave up. Its result can't be saved,
+   * so the task stays `processing` and is recovered later.
+   * @private
+   * @param {Database} db - The database the task came from
+   * @param {Object} task - The task row
+   * @returns {boolean} True if the result can't be saved
+   */
+  _isResultLost(db, task) {
+    if (!db.closed) {
+      return false;
+    }
+    this.logger.warn(
+      `litequ: task ${task.id} (${task.job_name}) finished after the queue closed; its result was not saved`
+    );
+    return true;
   }
 
   /**
@@ -272,11 +949,16 @@ class Queue extends EventEmitter {
    * @private
    * @param {Object} task - The failed task object
    * @param {Error} error - The error that caused the task to fail
+   * @param {Database} [db=this.db] - The database the task came from
    * @returns {Promise<void>} Promise that resolves after handling the failure
    * @fires Queue#retried
    * @fires Queue#failed
    */
-  async _handleTaskFailure(task, error) {
+  async _handleTaskFailure(task, error, db = this.db) {
+    if (this._isResultLost(db, task)) {
+      return;
+    }
+
     const retryCount = task.retry_count + 1;
     const job = this.jobs.get(task.job_name);
 
@@ -288,15 +970,19 @@ class Queue extends EventEmitter {
       const delay = Math.floor(jitterDelay);
       const nextRetryAt = new Date(Date.now() + delay).toISOString();
 
-      this.db.updateTaskStatus(task.id, 'failed', retryCount, nextRetryAt);
-
-      let taskData;
-      try {
-        taskData = JSON.parse(task.task_data);
-      } catch (parseError) {
-        console.error('Error parsing task data:', parseError);
-        taskData = { raw: task.task_data };
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'failed',
+        retryCount,
+        nextRetryAt,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
       }
+
+      const taskData = this._parseTaskDataForEvent(task);
 
       const eventData = {
         taskId: task.id,
@@ -315,15 +1001,19 @@ class Queue extends EventEmitter {
 
       this._scheduleNextWake();
     } else {
-      this.db.updateTaskStatus(task.id, 'failed', retryCount, null);
-
-      let taskData;
-      try {
-        taskData = JSON.parse(task.task_data);
-      } catch (parseError) {
-        console.error('Error parsing task data:', parseError);
-        taskData = { raw: task.task_data };
+      const { changes } = db.updateTaskStatus(
+        task.id,
+        'failed',
+        retryCount,
+        null,
+        { lockedBy: this.instanceId }
+      );
+      if (changes === 0) {
+        this._warnLeaseLost(task);
+        return;
       }
+
+      const taskData = this._parseTaskDataForEvent(task);
 
       const eventData = {
         taskId: task.id,
@@ -337,6 +1027,41 @@ class Queue extends EventEmitter {
       } else {
         this.emit('failed', { ...eventData, jobName: task.job_name });
       }
+    }
+  }
+
+  /**
+   * Parses a task's JSON data for an event payload. Invalid JSON is logged
+   * and returned as `{ raw }` so the event can still be emitted.
+   * @private
+   * @param {Object} task - The task row
+   * @returns {*} The parsed task data, or `{ raw: string }`
+   */
+  _parseTaskDataForEvent(task) {
+    try {
+      return JSON.parse(task.task_data);
+    } catch (parseError) {
+      this.logger.error(
+        `litequ: task ${task.id} has invalid JSON task data`,
+        parseError
+      );
+      return { raw: task.task_data };
+    }
+  }
+
+  /**
+   * Emits an `error` event, or logs the error when nobody listens. An `error`
+   * event without listeners would otherwise throw out of the queue.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {{ error: Error, operation: string, jobName?: string }} info - Error details
+   * @returns {void}
+   * @fires Queue#error
+   */
+  _emitError(info) {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', info);
+    } else {
+      this.logger.error(`litequ: ${info.operation} failed`, info.error);
     }
   }
 
@@ -365,7 +1090,7 @@ class Queue extends EventEmitter {
     const hasAnyHandler = Array.from(this.jobs.values()).some(
       (job) => job.handler
     );
-    if (!this.autoProcess || !hasAnyHandler) {
+    if (!this.autoProcess || !hasAnyHandler || this.paused || this.closed) {
       return;
     }
 
@@ -374,9 +1099,15 @@ class Queue extends EventEmitter {
       return;
     }
 
-    const earliest = this.db.getEarliestNextRetryTime();
+    // Wake for the next due retry, or when another worker's lease on one of
+    // our jobs expires. Jobs without a handler are ignored: they can't be
+    // claimed, and waking for them would spin.
+    const jobNames = Array.from(this.jobs.entries())
+      .filter(([, job]) => job.handler)
+      .map(([name]) => name);
+    const earliest = this.db.getNextWakeTime(jobNames);
 
-    // No scheduled retries, remain idle. New tasks will wake via add().
+    // Nothing scheduled, remain idle. New tasks will wake via add().
     if (!earliest) {
       return;
     }
@@ -427,23 +1158,137 @@ class Queue extends EventEmitter {
   }
 
   /**
-   * Gracefully closes the queue by stopping polling and waiting for running tasks to complete.
-   * @returns {Promise<void>} Promise that resolves when the queue is fully closed
+   * Stops starting new batches and clears the retry wake-up timer. Tasks that
+   * are already running finish normally, and `add()` still stores new tasks.
+   * @returns {void}
    */
-  async close() {
+  pause() {
+    if (this.closed) {
+      return;
+    }
+    this.paused = true;
     this.stopPolling();
+  }
 
-    // Wait for current tasks to finish
-    while (this.currentRunning > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+  /**
+   * Clears a pause and, when autoProcess is enabled, starts processing ready
+   * tasks right away, including tasks added while paused.
+   * @returns {void}
+   */
+  resume() {
+    if (this.closed || !this.paused) {
+      return;
+    }
+    this.paused = false;
+
+    if (this.autoProcess) {
+      this._processNextBatch();
+    }
+  }
+
+  /**
+   * Resolves once no batch or task is running and no follow-up batch is
+   * scheduled. Resolves immediately if the queue is already idle.
+   * @returns {Promise<void>} Promise that resolves when the queue is idle
+   */
+  whenIdle() {
+    if (this._isIdle()) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this._internal.once('idle', () => resolve());
+    });
+  }
+
+  /**
+   * Waits for the queue to become idle, up to an optional timeout.
+   * @private
+   * @param {number} [timeout] - Maximum milliseconds to wait; no limit when omitted
+   * @returns {Promise<boolean>} True if the queue became idle, false on timeout
+   */
+  async _waitForIdle(timeout) {
+    if (timeout === undefined || timeout === null) {
+      await this.whenIdle();
+      return true;
     }
 
-    return this.db.close();
+    let timer;
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeout);
+    });
+    try {
+      return await Promise.race([this.whenIdle().then(() => true), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Stops every timer the queue owns.
+   * @private
+   * @returns {void}
+   */
+  _stopTimers() {
+    this.stopPolling();
+    if (this._roleTimer) {
+      clearInterval(this._roleTimer);
+      this._roleTimer = null;
+    }
+  }
+
+  /**
+   * Closes the queue: pauses it, stops its timers, waits for running tasks
+   * and closes the database connection. Calling it again returns the same
+   * promise. After `close()`, `add()` throws.
+   * @param {Object} [options={}] - Close options
+   * @param {number} [options.timeout] - Maximum milliseconds to wait for running tasks; no limit when omitted
+   * @returns {Promise<void>} Promise that resolves when the queue is fully closed
+   */
+  close(options = {}) {
+    if (!this._closePromise) {
+      this._closePromise = this._close(options);
+    }
+    return this._closePromise;
+  }
+
+  /**
+   * Implements `close()`.
+   * @private
+   * @param {{ timeout?: number }} options - Close options
+   * @returns {Promise<void>} Promise that resolves when the queue is closed
+   */
+  async _close({ timeout } = {}) {
+    const registry = globalThis[REGISTRY_KEY];
+    if (
+      this._sharedKey !== undefined &&
+      registry?.get(this._sharedKey) === this
+    ) {
+      registry.delete(this._sharedKey);
+    }
+
+    this.pause();
+    this.closed = true;
+    this._stopTimers();
+
+    const idle = await this._waitForIdle(timeout);
+    if (!idle) {
+      this.logger.warn(
+        `litequ: close() timed out after ${timeout} ms with ${this.currentRunning} task(s) still running`
+      );
+    }
+
+    await this.db.close();
+
+    // Tasks still running after a timeout can't renew leases on a closed
+    // database; their leases expire and another worker picks them up.
+    for (const timer of this._heartbeats) {
+      this._stopHeartbeat(timer);
+    }
   }
 
   /**
    * Gets the current status of the queue.
-   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, and jobs properties
+   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, paused, closed, writable, dbPath, and jobs properties
    */
   get status() {
     const jobsStatus = {};
@@ -458,6 +1303,10 @@ class Queue extends EventEmitter {
       maxConcurrent: this.maxConcurrent,
       isProcessing: this.isProcessing,
       autoProcess: this.autoProcess,
+      paused: this.paused,
+      closed: this.closed,
+      writable: this.writable,
+      dbPath: this.dbPath,
       jobs: jobsStatus,
     };
   }

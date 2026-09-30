@@ -129,7 +129,7 @@ async function basicExample() {
     // Process tasks multiple times to handle retries
     for (let round = 1; round <= 5; round++) {
       console.log(`--- Processing Round ${round} ---`);
-      await queue._processNextBatch();
+      await queue.processOnce();
 
       // Wait a bit between rounds to see retry delays in action
       await new Promise((resolve) => setTimeout(resolve, 1500));
