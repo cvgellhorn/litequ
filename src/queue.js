@@ -51,10 +51,16 @@ class Job extends EventEmitter {
    * Adds a new task to this job's queue.
    * @param {*} taskData - The data for the task (will be JSON serialized)
    * @returns {number} The ID of the newly added task
-   * @throws {Error} When task insertion fails
+   * @throws {Error} When task insertion fails or the queue is closed
    * @fires Job#added
    */
   add(taskData) {
+    if (this.queue.closed) {
+      throw new Error(
+        `litequ: cannot add a task to job "${this.name}" because the queue is closed`
+      );
+    }
+
     try {
       const taskId = this.queue.db.insertTask(
         this.name,
@@ -75,7 +81,7 @@ class Job extends EventEmitter {
         } else {
           // Cancel any scheduled wake since we have immediate work now
           this.queue.stopPolling();
-          setImmediate(() => this.queue._processNextBatch());
+          this.queue._scheduleBatch();
         }
       }
 
@@ -111,6 +117,7 @@ class Job extends EventEmitter {
  * @fires Queue#failed - When a task fails after all retries
  * @fires Queue#retried - When a task is scheduled for retry
  * @fires Queue#error - When an error occurs during queue operations
+ * @fires Queue#idle - When the queue has finished its work and nothing is running
  */
 class Queue extends EventEmitter {
   /**
@@ -147,6 +154,13 @@ class Queue extends EventEmitter {
     this.pollingTimer = null; // used as a one-shot wake-up timer
     this._activeBatch = null; // Promise of the batch currently being processed
     this._tasksAddedDuringProcessing = false; // Flag to track if tasks were added while processing
+    this.paused = false;
+    this.closed = false;
+    this._closePromise = null;
+    this._scheduledBatches = 0; // setImmediate batches that haven't started yet
+    this._manualDrains = 0; // processOnce() calls in progress
+    this._workSinceIdle = false; // whether any task ran since the last idle event
+    this._internal = new EventEmitter(); // internal events, safe from removeAllListeners()
   }
 
   /**
@@ -207,7 +221,7 @@ class Queue extends EventEmitter {
    * Runs in batches of up to maxConcurrent and resolves once no ready tasks remain.
    * Works whether or not autoProcess is enabled; if an automatic batch is in
    * flight, it waits for that batch first. Retries that are not yet due are left
-   * for a later call.
+   * for a later call. Does nothing while the queue is paused or closed.
    * @returns {Promise<number>} Number of tasks attempted (completed or failed)
    * @throws {TypeError} When called with a handler (removed legacy signature)
    * @fires Queue#error
@@ -221,18 +235,25 @@ class Queue extends EventEmitter {
     }
 
     let processed = 0;
-    for (;;) {
-      if (this.isProcessing) {
-        await this._activeBatch;
-        continue;
-      }
+    this._manualDrains++;
+    try {
+      while (!this.paused && !this.closed) {
+        if (this.isProcessing) {
+          await this._activeBatch;
+          continue;
+        }
 
-      const count = await this._processNextBatch(false);
-      if (count === 0) {
-        return processed;
+        const count = await this._processNextBatch(false);
+        if (count === 0) {
+          break;
+        }
+        processed += count;
       }
-      processed += count;
+    } finally {
+      this._manualDrains--;
+      this._checkIdle();
     }
+    return processed;
   }
 
   /**
@@ -244,6 +265,9 @@ class Queue extends EventEmitter {
    * @fires Queue#error
    */
   _processNextBatch(continueInBackground = true) {
+    if (this.paused || this.closed) {
+      return Promise.resolve(0);
+    }
     if (this.isProcessing) {
       return this._activeBatch; // Already processing
     }
@@ -288,6 +312,10 @@ class Queue extends EventEmitter {
         jobNamesWithHandlers
       );
 
+      if (tasks.length > 0) {
+        this._workSinceIdle = true;
+      }
+
       const processingPromises = tasks.map((task) => this._processTask(task));
       await Promise.all(processingPromises);
 
@@ -296,7 +324,7 @@ class Queue extends EventEmitter {
         tasks.length === availableSlots &&
         this.currentRunning < this.maxConcurrent
       ) {
-        setImmediate(() => this._processNextBatch());
+        this._scheduleBatch();
       }
 
       return tasks.length;
@@ -308,10 +336,60 @@ class Queue extends EventEmitter {
 
       if (this._tasksAddedDuringProcessing) {
         this._tasksAddedDuringProcessing = false;
-        setImmediate(() => this._processNextBatch());
+        this._scheduleBatch();
       } else {
         this._scheduleNextWake();
       }
+
+      this._checkIdle();
+    }
+  }
+
+  /**
+   * Starts a batch on the next turn of the event loop. While it's pending the
+   * queue doesn't count as idle.
+   * @private
+   * @returns {void}
+   */
+  _scheduleBatch() {
+    this._scheduledBatches++;
+    setImmediate(() => {
+      this._scheduledBatches--;
+      this._processNextBatch();
+      this._checkIdle();
+    });
+  }
+
+  /**
+   * Whether no batch, task, scheduled batch or processOnce() call is running.
+   * @private
+   * @returns {boolean} True when the queue is idle
+   */
+  _isIdle() {
+    return (
+      !this.isProcessing &&
+      this.currentRunning === 0 &&
+      this._scheduledBatches === 0 &&
+      this._manualDrains === 0
+    );
+  }
+
+  /**
+   * Emits the internal and public `idle` events if the queue has become idle.
+   * The public event fires only if a task ran since the last one.
+   * @private
+   * @returns {void}
+   * @fires Queue#idle
+   */
+  _checkIdle() {
+    if (!this._isIdle()) {
+      return;
+    }
+
+    this._internal.emit('idle');
+    if (this._workSinceIdle) {
+      this._workSinceIdle = false;
+      this.emit('idle');
     }
   }
 
@@ -323,10 +401,13 @@ class Queue extends EventEmitter {
    * @fires Queue#completed
    */
   async _processTask(task) {
+    // Status updates go to the database the task came from, even if the
+    // queue's connection changes while the handler runs.
+    const db = this.db;
     this.currentRunning++;
 
     try {
-      this.db.updateTaskStatus(task.id, 'processing', task.retry_count, null);
+      db.updateTaskStatus(task.id, 'processing', task.retry_count, null);
 
       let taskData;
       try {
@@ -341,14 +422,36 @@ class Queue extends EventEmitter {
       }
 
       const result = await job.handler(taskData);
-      this.db.updateTaskStatus(task.id, 'completed', task.retry_count, null);
+      if (this._isResultLost(db, task)) {
+        return;
+      }
+      db.updateTaskStatus(task.id, 'completed', task.retry_count, null);
 
       job._emit('completed', { taskId: task.id, result, taskData });
     } catch (error) {
-      await this._handleTaskFailure(task, error);
+      await this._handleTaskFailure(task, error, db);
     } finally {
       this.currentRunning--;
     }
+  }
+
+  /**
+   * Checks whether a task finished after its database was closed, for
+   * example after `close({ timeout })` gave up. Its result can't be saved,
+   * so the task stays `processing` and is recovered later.
+   * @private
+   * @param {Database} db - The database the task came from
+   * @param {Object} task - The task row
+   * @returns {boolean} True if the result can't be saved
+   */
+  _isResultLost(db, task) {
+    if (!db.closed) {
+      return false;
+    }
+    this.logger.warn(
+      `litequ: task ${task.id} (${task.job_name}) finished after the queue closed; its result was not saved`
+    );
+    return true;
   }
 
   /**
@@ -356,11 +459,16 @@ class Queue extends EventEmitter {
    * @private
    * @param {Object} task - The failed task object
    * @param {Error} error - The error that caused the task to fail
+   * @param {Database} [db=this.db] - The database the task came from
    * @returns {Promise<void>} Promise that resolves after handling the failure
    * @fires Queue#retried
    * @fires Queue#failed
    */
-  async _handleTaskFailure(task, error) {
+  async _handleTaskFailure(task, error, db = this.db) {
+    if (this._isResultLost(db, task)) {
+      return;
+    }
+
     const retryCount = task.retry_count + 1;
     const job = this.jobs.get(task.job_name);
 
@@ -372,7 +480,7 @@ class Queue extends EventEmitter {
       const delay = Math.floor(jitterDelay);
       const nextRetryAt = new Date(Date.now() + delay).toISOString();
 
-      this.db.updateTaskStatus(task.id, 'failed', retryCount, nextRetryAt);
+      db.updateTaskStatus(task.id, 'failed', retryCount, nextRetryAt);
 
       const taskData = this._parseTaskDataForEvent(task);
 
@@ -393,7 +501,7 @@ class Queue extends EventEmitter {
 
       this._scheduleNextWake();
     } else {
-      this.db.updateTaskStatus(task.id, 'failed', retryCount, null);
+      db.updateTaskStatus(task.id, 'failed', retryCount, null);
 
       const taskData = this._parseTaskDataForEvent(task);
 
@@ -472,7 +580,7 @@ class Queue extends EventEmitter {
     const hasAnyHandler = Array.from(this.jobs.values()).some(
       (job) => job.handler
     );
-    if (!this.autoProcess || !hasAnyHandler) {
+    if (!this.autoProcess || !hasAnyHandler || this.paused || this.closed) {
       return;
     }
 
@@ -534,23 +642,119 @@ class Queue extends EventEmitter {
   }
 
   /**
-   * Gracefully closes the queue by stopping polling and waiting for running tasks to complete.
-   * @returns {Promise<void>} Promise that resolves when the queue is fully closed
+   * Stops starting new batches and clears the retry wake-up timer. Tasks that
+   * are already running finish normally, and `add()` still stores new tasks.
+   * @returns {void}
    */
-  async close() {
+  pause() {
+    if (this.closed) {
+      return;
+    }
+    this.paused = true;
     this.stopPolling();
+  }
 
-    // Wait for current tasks to finish
-    while (this.currentRunning > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+  /**
+   * Clears a pause and, when autoProcess is enabled, starts processing ready
+   * tasks right away, including tasks added while paused.
+   * @returns {void}
+   */
+  resume() {
+    if (this.closed || !this.paused) {
+      return;
+    }
+    this.paused = false;
+
+    if (this.autoProcess) {
+      this._processNextBatch();
+    }
+  }
+
+  /**
+   * Resolves once no batch or task is running and no follow-up batch is
+   * scheduled. Resolves immediately if the queue is already idle.
+   * @returns {Promise<void>} Promise that resolves when the queue is idle
+   */
+  whenIdle() {
+    if (this._isIdle()) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this._internal.once('idle', () => resolve());
+    });
+  }
+
+  /**
+   * Waits for the queue to become idle, up to an optional timeout.
+   * @private
+   * @param {number} [timeout] - Maximum milliseconds to wait; no limit when omitted
+   * @returns {Promise<boolean>} True if the queue became idle, false on timeout
+   */
+  async _waitForIdle(timeout) {
+    if (timeout === undefined || timeout === null) {
+      await this.whenIdle();
+      return true;
     }
 
-    return this.db.close();
+    let timer;
+    const timedOut = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeout);
+    });
+    try {
+      return await Promise.race([this.whenIdle().then(() => true), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Stops every timer the queue owns.
+   * @private
+   * @returns {void}
+   */
+  _stopTimers() {
+    this.stopPolling();
+  }
+
+  /**
+   * Closes the queue: pauses it, stops its timers, waits for running tasks
+   * and closes the database connection. Calling it again returns the same
+   * promise. After `close()`, `add()` throws.
+   * @param {Object} [options={}] - Close options
+   * @param {number} [options.timeout] - Maximum milliseconds to wait for running tasks; no limit when omitted
+   * @returns {Promise<void>} Promise that resolves when the queue is fully closed
+   */
+  close(options = {}) {
+    if (!this._closePromise) {
+      this._closePromise = this._close(options);
+    }
+    return this._closePromise;
+  }
+
+  /**
+   * Implements `close()`.
+   * @private
+   * @param {{ timeout?: number }} options - Close options
+   * @returns {Promise<void>} Promise that resolves when the queue is closed
+   */
+  async _close({ timeout } = {}) {
+    this.pause();
+    this.closed = true;
+    this._stopTimers();
+
+    const idle = await this._waitForIdle(timeout);
+    if (!idle) {
+      this.logger.warn(
+        `litequ: close() timed out after ${timeout} ms with ${this.currentRunning} task(s) still running`
+      );
+    }
+
+    await this.db.close();
   }
 
   /**
    * Gets the current status of the queue.
-   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, and jobs properties
+   * @returns {Object} Status object with currentRunning, maxConcurrent, isProcessing, autoProcess, paused, closed, and jobs properties
    */
   get status() {
     const jobsStatus = {};
@@ -565,6 +769,8 @@ class Queue extends EventEmitter {
       maxConcurrent: this.maxConcurrent,
       isProcessing: this.isProcessing,
       autoProcess: this.autoProcess,
+      paused: this.paused,
+      closed: this.closed,
       jobs: jobsStatus,
     };
   }

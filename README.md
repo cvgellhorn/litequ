@@ -215,12 +215,41 @@ Remove completed tasks older than specified hours.
 await queue.cleanup(24); // Remove completed tasks older than 24 hours
 ```
 
-#### `close()`
+#### `pause()`
 
-Close the queue and database connection.
+Stop starting new batches and clear the retry wake-up timer. Tasks that are already running finish normally. `job.add()` still stores tasks while the queue is paused, and `processOnce()` does nothing.
 
 ```javascript
-await queue.close();
+queue.pause();
+```
+
+#### `resume()`
+
+Clear a pause. With `autoProcess` enabled, processing starts right away, including tasks added while the queue was paused.
+
+```javascript
+queue.resume();
+```
+
+#### `whenIdle()`
+
+Returns a promise that resolves once no batch or task is running and no follow-up batch is scheduled. It resolves immediately if the queue is already idle. Combine it with `pause()` to wait for the queue to settle:
+
+```javascript
+queue.pause();
+await queue.whenIdle(); // running tasks have finished; nothing new starts
+```
+
+#### `close({ timeout })`
+
+Close the queue: pause it, stop its timers, wait for running tasks to finish, then close the database connection.
+
+- `timeout` (ms, default: no limit) caps the wait. If it runs out, the connection is closed anyway and a warning names how many tasks were still running. Those tasks stay `processing` in the database and are restarted later (see [Interrupted tasks](#interrupted-tasks)).
+- Calling `close()` again returns the same promise.
+- After `close()`, `job.add()` throws.
+
+```javascript
+await queue.close({ timeout: 4000 });
 ```
 
 ### Job Methods
@@ -260,6 +289,8 @@ const status = queue.status;
 console.log(status.currentRunning); // Currently processing tasks
 console.log(status.maxConcurrent); // Maximum concurrent tasks
 console.log(status.isProcessing); // Whether queue is actively processing
+console.log(status.paused); // Whether pause() is in effect
+console.log(status.closed); // Whether close() has been called
 console.log(status.jobs); // Object with job names and their handler status
 ```
 
@@ -327,6 +358,12 @@ queue.on('retried', (info) => {
 // Error events (queue operations)
 queue.on('error', (info) => {
   console.error(`Queue error in ${info.operation}:`, info.error);
+});
+
+// The queue has finished its work: no batch or task is running.
+// Fires only if at least one task ran since the last 'idle'.
+queue.on('idle', () => {
+  console.log('Queue is idle');
 });
 ```
 
@@ -580,7 +617,8 @@ setInterval(() => {
 ```javascript
 process.on('SIGTERM', async () => {
   console.log('Shutting down gracefully...');
-  await queue.close(); // Wait for current tasks to finish
+  // Wait up to 4 s for current tasks, then close anyway
+  await queue.close({ timeout: 4000 });
   process.exit(0);
 });
 ```

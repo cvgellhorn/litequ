@@ -47,6 +47,7 @@ class Database {
     this.logger = createLogger(options.logger);
     this.db = null;
     this.initialized = false;
+    this.closed = false;
 
     if (!Number.isInteger(this.busyTimeout) || this.busyTimeout < 0) {
       throw new TypeError('busyTimeout must be a non-negative integer');
@@ -62,6 +63,9 @@ class Database {
    * @throws {Error} When database connection fails
    */
   _createConnection() {
+    if (this.closed) {
+      throw new Error(`litequ: database ${this.dbPath} is closed`);
+    }
     if (!this.db) {
       try {
         this.db = new BetterSqlite3(this.dbPath);
@@ -347,27 +351,26 @@ class Database {
   }
 
   /**
-   * Closes the database connection gracefully.
+   * Closes the database connection gracefully. A closed Database can't be
+   * reopened; later calls throw instead of silently opening a new connection.
    * @returns {Promise<void>} Promise that resolves when the database is closed
    */
   close() {
-    return new Promise((resolve) => {
-      if (this.db) {
-        const dbToClose = this.db;
-        this.db = null; // Immediately set to null to prevent race conditions
-        this.initialized = false;
+    this.closed = true;
+    this.initialized = false;
 
-        try {
-          dbToClose.close();
-          resolve();
-        } catch (err) {
-          this.logger.error('litequ: error closing database', err);
-          resolve();
-        }
-      } else {
-        resolve();
+    if (this.db) {
+      const dbToClose = this.db;
+      this.db = null;
+
+      try {
+        dbToClose.close();
+      } catch (err) {
+        this.logger.error('litequ: error closing database', err);
       }
-    });
+    }
+
+    return Promise.resolve();
   }
 }
 
