@@ -140,6 +140,7 @@ class Queue extends EventEmitter {
     this.isProcessing = false;
     this.jobs = new Map(); // Map of job name -> Job instance
     this.pollingTimer = null; // used as a one-shot wake-up timer
+    this._activeBatch = null; // Promise of the batch currently being processed
     this._tasksAddedDuringProcessing = false; // Flag to track if tasks were added while processing
   }
 
@@ -170,21 +171,68 @@ class Queue extends EventEmitter {
   }
 
   /**
-   * Processes the next batch of available tasks.
-   * @internal - This method is part of the internal API between Job and Queue
-   * @returns {Promise<void>} Promise that resolves after batch processing
+   * Processes every task that is ready now, for all jobs with a registered handler.
+   * Runs in batches of up to maxConcurrent and resolves once no ready tasks remain.
+   * Works whether or not autoProcess is enabled; if an automatic batch is in
+   * flight, it waits for that batch first. Retries that are not yet due are left
+   * for a later call.
+   * @returns {Promise<number>} Number of tasks attempted (completed or failed)
+   * @throws {TypeError} When called with a handler (removed legacy signature)
    * @fires Queue#error
    */
-  async _processNextBatch() {
-    if (this.isProcessing) {
-      return; // Already processing
+  async processOnce(...args) {
+    if (args.length > 0) {
+      throw new TypeError(
+        'processOnce() no longer accepts a handler. Register handlers with ' +
+          'queue.createJob(name).process(handler), then call queue.processOnce().'
+      );
     }
 
+    let processed = 0;
+    for (;;) {
+      if (this.isProcessing) {
+        await this._activeBatch;
+        continue;
+      }
+
+      const count = await this._processNextBatch(false);
+      if (count === 0) {
+        return processed;
+      }
+      processed += count;
+    }
+  }
+
+  /**
+   * Processes the next batch of available tasks.
+   * If a batch is already running, returns that batch's promise instead.
+   * @internal - This method is part of the internal API between Job and Queue
+   * @param {boolean} [continueInBackground=true] - Schedule the next batch when this one was full
+   * @returns {Promise<number>} Promise resolving to the number of tasks in the batch
+   * @fires Queue#error
+   */
+  _processNextBatch(continueInBackground = true) {
+    if (this.isProcessing) {
+      return this._activeBatch; // Already processing
+    }
+
+    this._activeBatch = this._runBatch(continueInBackground);
+    return this._activeBatch;
+  }
+
+  /**
+   * Fetches and processes one batch of ready tasks.
+   * @private
+   * @param {boolean} continueInBackground - Schedule the next batch when this one was full
+   * @returns {Promise<number>} Promise resolving to the number of tasks in the batch
+   * @fires Queue#error
+   */
+  async _runBatch(continueInBackground) {
     const hasJobHandlers = Array.from(this.jobs.values()).some(
       (job) => job.handler
     );
     if (!hasJobHandlers) {
-      return;
+      return 0;
     }
 
     this.isProcessing = true;
@@ -193,7 +241,7 @@ class Queue extends EventEmitter {
     try {
       const availableSlots = this.maxConcurrent - this.currentRunning;
       if (availableSlots <= 0) {
-        return;
+        return 0;
       }
 
       const now = new Date().toISOString();
@@ -212,13 +260,17 @@ class Queue extends EventEmitter {
       await Promise.all(processingPromises);
 
       if (
+        continueInBackground &&
         tasks.length === availableSlots &&
         this.currentRunning < this.maxConcurrent
       ) {
         setImmediate(() => this._processNextBatch());
       }
+
+      return tasks.length;
     } catch (error) {
       this.emit('error', { error, operation: 'process' });
+      return 0;
     } finally {
       this.isProcessing = false;
 

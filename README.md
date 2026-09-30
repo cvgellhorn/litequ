@@ -131,6 +131,24 @@ await smsJob.process(async (taskData) => {
 });
 ```
 
+#### `processOnce()`
+
+Process every task that is ready now, for all jobs with a registered handler, and resolve with the number of tasks attempted. Tasks run in batches of up to `maxConcurrent` until none are ready. Retries that aren't due yet are left for a later call. This is the way to process tasks when `autoProcess` is `false`, for example from a cron job:
+
+```javascript
+const queue = new Queue({ autoProcess: false });
+const emailJob = queue.createJob('email');
+
+await emailJob.process(async (taskData) => {
+  await sendEmail(taskData);
+});
+
+const processed = await queue.processOnce();
+console.log(`Processed ${processed} tasks`);
+```
+
+> Migrating from `@sturmfrei/litequu`: `processOnce()` no longer takes a handler and throws if one is passed. Register handlers with `createJob(name).process(handler)` instead.
+
 #### `getStats()`
 
 Get queue statistics grouped by job name and status.
