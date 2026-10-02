@@ -31,18 +31,19 @@
   "author": "Christoph von Gellhorn",
   "license": "MIT",
   "dependencies": {
-    "better-sqlite3": "^12.2.0"
+    "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
-    "@eslint/js": "^9.35.0",
+    "@eslint/js": "^10.0.1",
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^22.20.4",
-    "eslint": "^9.35.0",
+    "@types/node": "^26.6.4",
+    "eslint": "^10.11.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-prettier": "^5.5.4",
-    "prettier": "^3.6.2",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "eslint-plugin-prettier": "^5.5.6",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
   },
   "engines": {
     "node": ">=22.0.0"

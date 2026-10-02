@@ -823,7 +823,9 @@ class Queue extends EventEmitter {
       try {
         taskData = JSON.parse(task.task_data);
       } catch (parseError) {
-        throw new Error(`Invalid task data JSON: ${parseError.message}`);
+        throw new Error(`Invalid task data JSON: ${parseError.message}`, {
+          cause: parseError,
+        });
       }
 
       const job = this.jobs.get(task.job_name);
