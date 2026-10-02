@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.1](https://github.com/cvgellhorn/litequ/compare/v2.1.0...v2.1.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* target ES2022 so typecheck accepts Error cause ([c600173](https://github.com/cvgellhorn/litequ/commit/c600173eb893175670e91384d9a36a3fe13035ec))
+
 ## [2.1.0](https://github.com/cvgellhorn/litequ/compare/v2.0.0...v2.1.0) (2026-10-02)
 
 

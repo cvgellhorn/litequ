@@ -1,6 +1,6 @@
 {
   "name": "litequ",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "A simple same-thread queuing system for Node.js using SQLite with retry mechanism and exponential backoff",
   "main": "src/index.js",
   "types": "types/index.d.ts",
