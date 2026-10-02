@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.0](https://github.com/cvgellhorn/litequ/compare/v2.0.0...v2.1.0) (2026-10-02)
+
+
+### Features
+
+* **deps:** bump all dependencies to latest ([ec3fa76](https://github.com/cvgellhorn/litequ/commit/ec3fa7602a24fe3007083432b6778b584ce52247))
+* **deps:** bump all dependencies to latest ([0dc6e34](https://github.com/cvgellhorn/litequ/commit/0dc6e3434384f62070f2bbab317fe261a939e925))
+
 ## [2.0.0](https://github.com/cvgellhorn/litequ/compare/v1.0.0...v2.0.0) (2026-09-30)
 
 
