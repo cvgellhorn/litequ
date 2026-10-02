@@ -36,10 +36,9 @@ jobs:
           registry-url: https://registry.npmjs.org
       # Trusted publishing (OIDC) needs npm 11.5.1+; Node 22 ships npm 10.
       - run: npm install -g npm@^11.5.1
+      # Checks run in ci.yml on every PR. Dev dependencies are still needed
+      # because prepack builds the type declarations.
       - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
       # Authenticates through the npm trusted publisher for this workflow;
       # no token needed, and provenance is attached automatically.
       - run: npm publish --access public
