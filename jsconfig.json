@@ -5,7 +5,6 @@
     "allowJs": true,
     "checkJs": true,
     "moduleResolution": "bundler",
-    "baseUrl": ".",
     "resolveJsonModule": true,
     "strict": false,
     "noEmit": true
